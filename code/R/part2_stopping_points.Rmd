@@ -1,0 +1,1331 @@
+---
+title: "Part 2 — Stopping analysis: R-peak prominence, plateaus, and retained components"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  sesoi_prop: 0.05
+  use_bounded_sesoi: false
+  sesoi_floor: 0.01
+  sesoi_cap: 0.50
+  run_model_summaries: true
+  save_figures: true
+  show_manifest: false
+  model_sesoi_definition: "median_subject_channel"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(purrr)
+  library(stringr)
+  library(ggplot2)
+  library(knitr)
+  library(brms)
+  library(emmeans)
+  library(tidybayes)
+  library(cmdstanr)
+  library(rstudioapi)
+  library(R.matlab)
+})
+
+codepath <- dirname(rstudioapi::getSourceEditorContext()$path)
+project_root <- dirname(dirname(codepath))
+datapath <- file.path(project_root, "data")
+vispath <- file.path(project_root, "vis")
+modelpath <- file.path(datapath, "models")
+
+outpath <- file.path(datapath, "results_markdown", "part2_stopping")
+figpath <- file.path(vispath, "results", "part2_stopping")
+dir.create(outpath, recursive = TRUE, showWarnings = FALSE)
+dir.create(figpath, recursive = TRUE, showWarnings = FALSE)
+
+source(file.path(codepath, "data_loading_functions.R"))
+
+settings <- list(
+  methods_keep = c("ICA", "CCA"),
+  sesoi_prop = params$sesoi_prop,
+  use_bounded_sesoi = params$use_bounded_sesoi,
+  sesoi_floor = params$sesoi_floor,
+  sesoi_cap = params$sesoi_cap,
+  model_useful_p_decrease_by_sesoi_min = 0.80,
+  model_plateau_p_decrease_by_sesoi_max = 0.20,
+  model_plateau_p_same_min = 0.80,
+  model_harm_p_increase_by_sesoi_min = 0.80,
+  model_sesoi_definition = params$model_sesoi_definition,
+  model_rpeak_file = file.path(modelpath, "main_all_channels.rds")
+)
+
+safe_q <- function(x, p) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  unname(stats::quantile(x, probs = p, na.rm = TRUE))
+}
+
+safe_mean <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  mean(x)
+}
+
+safe_median <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  median(x)
+}
+
+mode_int <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_integer_)
+  tab <- sort(table(x), decreasing = TRUE)
+  as.integer(names(tab)[1])
+}
+
+first_true_value <- function(value, flag, default = NA_integer_) {
+  ok <- which(flag %in% TRUE)
+  if (length(ok) == 0) return(default)
+  value[min(ok)]
+}
+
+last_true_value <- function(value, flag, default = NA_integer_) {
+  ok <- which(flag %in% TRUE)
+  if (length(ok) == 0) return(default)
+  value[max(ok)]
+}
+
+parse_consec_contrast <- function(x) {
+  nums <- stringr::str_extract_all(as.character(x), "\\d+")
+  purrr::map_dfr(nums, function(z) {
+    z <- as.integer(z)
+    if (length(z) >= 2) {
+      tibble(clean_to = z[1], clean_from = z[2])
+    } else {
+      tibble(clean_to = NA_integer_, clean_from = NA_integer_)
+    }
+  })
+}
+
+fmt_num <- function(x, digits = 2) {
+  x <- as.numeric(x)
+  ifelse(is.na(x), "NA", formatC(x, format = "f", digits = digits))
+}
+
+fmt_pct <- function(x, digits = 1) {
+  x <- as.numeric(x)
+  ifelse(is.na(x), "NA", paste0(formatC(x, format = "f", digits = digits), "%"))
+}
+
+save_table <- function(x, name, csv = TRUE) {
+  rds_file <- file.path(outpath, paste0(name, ".rds"))
+  saveRDS(x, rds_file)
+  csv_file <- NA_character_
+  if (csv) {
+    csv_file <- file.path(outpath, paste0(name, ".csv"))
+    utils::write.csv(x, csv_file, row.names = FALSE)
+  }
+  tibble(
+    name = name,
+    rds = rds_file,
+    csv = csv_file,
+    n_rows = ifelse(is.data.frame(x), nrow(x), NA_integer_)
+  )
+}
+
+save_plot_both <- function(plot, name, width = 7, height = 4.5) {
+  if (!isTRUE(params$save_figures)) return(invisible(NULL))
+  ggsave(file.path(figpath, paste0(name, ".pdf")), plot, width = width, height = height, device = cairo_pdf)
+  ggsave(file.path(figpath, paste0(name, ".png")), plot, width = width, height = height, dpi = 300)
+}
+
+fig_font_family <- "Times New Roman"
+
+cca_pal <- list(
+  method = c(
+    "ICA" = "#1D4E89",
+    "CCA" = "#8A1538"
+  ),
+  highlight = "#39B54A",
+  zero = "#555555",
+  text = "#2B2B2B",
+  grid = "#E8E4DC",
+  strip = "#F3EFE7",
+  light_grey = "#D8D8D8",
+  mid_grey = "#8A8A8A",
+  dark_grey = "#3A3A3A",
+  heat = c("#EFEFEF", "#F6D96B", "#E07A3F", "#B2182B")
+)
+
+method_cols <- cca_pal$method
+
+transition_cols <- c(
+  "decrease > SESOI" = cca_pal$heat[2],
+  "within SESOI" = cca_pal$mid_grey,
+  "increase > SESOI" = cca_pal$heat[3]
+)
+
+probability_cols <- c(
+  "P(decrease > SESOI)" = cca_pal$heat[2],
+  "P(within SESOI)" = cca_pal$mid_grey,
+  "P(increase > SESOI)" = cca_pal$heat[3]
+)
+
+theme_pub <- theme_bw(base_size = 12, base_family = fig_font_family) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(size = 10, colour = cca_pal$text),
+    legend.text = element_text(size = 9.5, colour = cca_pal$text),
+    strip.background = element_rect(fill = cca_pal$strip, colour = NA),
+    strip.text = element_text(face = "bold", colour = cca_pal$text),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.25, colour = cca_pal$grid),
+    axis.title = element_text(colour = cca_pal$text),
+    axis.text = element_text(colour = cca_pal$text),
+    plot.title = element_text(face = "bold", size = 12, colour = cca_pal$text),
+    plot.subtitle = element_text(size = 10, colour = cca_pal$text),
+    plot.margin = margin(8, 8, 12, 8)
+  )
+
+manifest <- list()
+```
+
+# Analysis logic
+
+Part 1 established the method-level ICA versus CCA comparison. Part 2 asks a different question: **how many components should be removed before additional cleaning stops producing meaningful R-peak reduction?**
+
+Definitions used throughout:
+
+1. `clean == 1` is the no-cleaning baseline and is displayed as **0 components removed**.
+2. `clean == 2` means **1 component removed**, `clean == 3` means **2 components removed**, and so on.
+3. A consecutive step is **useful** if R-peak prominence decreases by more than the participant × EEG-channel SESOI.
+4. A consecutive step is a **plateau** if the change is within SESOI.
+5. A consecutive step is **harmful** if R-peak prominence increases by more than SESOI.
+
+Three stopping-related quantities are reported separately:
+
+1. **First non-useful**: conservative/early stopping. Stop before the first transition that does not produce a SESOI-meaningful R-peak decrease.
+2. **Last meaningful**: liberal/late stopping. Keep cleaning until the last transition that still produces a SESOI-meaningful R-peak decrease.
+3. **All meaningful candidates**: diagnostic count of how many component-removal steps produced a SESOI-meaningful improvement, aggregated across all transitions even if plateaus occurred before or between them.
+
+# Load full 15-channel R-peak data
+
+```{r load-rpeak-data, message=FALSE, warning=FALSE}
+load_full15_rpeak_all_methods <- function() {
+  chlabels_data1 <- load_chlabels_dataset("sub_chlabels.mat")
+  chlabels_data2 <- load_chlabels_dataset("sub_chlabels_data2.mat")
+  n_data1 <- length(chlabels_data1)
+  n_data2 <- length(chlabels_data2)
+  participant_levels <- sprintf("P%02d", seq_len(n_data1 + n_data2))
+  
+  df_data1 <- load_full15_rpeak_dataset(
+    data_file = "data4stats.mat",
+    chlabels_by_group = chlabels_data1,
+    dataset = "data1",
+    offset = 0,
+    methods = settings$methods_keep,
+    measure = "rpeak",
+    value_name = "rpeak"
+  )
+  
+  df_data2 <- load_full15_rpeak_dataset(
+    data_file = "data4stats_2.mat",
+    chlabels_by_group = chlabels_data2,
+    dataset = "data2",
+    offset = n_data1,
+    methods = settings$methods_keep,
+    measure = "rpeak",
+    value_name = "rpeak"
+  )
+  
+  bind_rows(df_data1, df_data2) %>%
+    mutate(
+      dataset = as.character(dataset),
+      participant = as.character(participant),
+      subID = factor(subID, levels = participant_levels),
+      method = factor(method, levels = c("ICA", "CCA")),
+      clean = as.integer(clean),
+      components_removed = clean - 1L,
+      cleaning_level = factor(clean, levels = sort(unique(clean))),
+      components_removed_factor = factor(components_removed, levels = sort(unique(components_removed))),
+      channel = as.character(channel)
+    ) %>%
+    filter(is.finite(rpeak))
+}
+
+full15_rpeak <- load_full15_rpeak_all_methods()
+
+manifest[["01_full15_rpeak_light"]] <- save_table(
+  full15_rpeak %>%
+    select(dataset, participant, method, channel, components_removed, rpeak),
+  "01_full15_rpeak_light",
+  csv = FALSE
+)
+```
+
+```{r sample-accounting}
+sample_accounting <- full15_rpeak %>%
+  distinct(dataset, participant, channel) %>%
+  summarise(
+    n_participants = n_distinct(participant),
+    n_participant_channel_cells = n(),
+    n_unique_channels = n_distinct(channel),
+    median_channels_per_participant = median(table(participant)),
+    min_channels_per_participant = min(table(participant)),
+    max_channels_per_participant = max(table(participant)),
+    .groups = "drop"
+  )
+
+manifest[["02_sample_accounting"]] <- save_table(
+  sample_accounting,
+  "02_sample_accounting"
+)
+
+kable(sample_accounting, digits = 2)
+```
+
+# SESOI definition
+
+```{r sesoi-definition}
+sesoi_raw <- full15_rpeak %>%
+  filter(components_removed == 0) %>%
+  group_by(dataset, participant, channel) %>%
+  summarise(
+    initial_subj = mean(rpeak, na.rm = TRUE),
+    n_baseline_values = n(),
+    n_methods_at_baseline = n_distinct(method),
+    sesoi_raw = settings$sesoi_prop * abs(initial_subj),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(initial_subj), is.finite(sesoi_raw), sesoi_raw > 0)
+
+sesoi_subj_channel <- sesoi_raw %>%
+  mutate(
+    sesoi = if (isTRUE(settings$use_bounded_sesoi)) {
+      pmin(pmax(sesoi_raw, settings$sesoi_floor), settings$sesoi_cap)
+    } else {
+      sesoi_raw
+    },
+    sesoi_was_floored = sesoi > sesoi_raw,
+    sesoi_was_capped = sesoi < sesoi_raw,
+    sesoi_definition = if_else(
+      isTRUE(settings$use_bounded_sesoi),
+      "bounded_5pct_subject_channel",
+      "raw_5pct_subject_channel"
+    )
+  )
+
+sesoi_distribution <- sesoi_subj_channel %>%
+  summarise(
+    n_participant_channel_cells = n(),
+    median_initial_rpeak = median(initial_subj, na.rm = TRUE),
+    q25_initial_rpeak = safe_q(initial_subj, 0.25),
+    q75_initial_rpeak = safe_q(initial_subj, 0.75),
+    min_sesoi = min(sesoi, na.rm = TRUE),
+    q05_sesoi = safe_q(sesoi, 0.05),
+    median_sesoi = median(sesoi, na.rm = TRUE),
+    q95_sesoi = safe_q(sesoi, 0.95),
+    max_sesoi = max(sesoi, na.rm = TRUE),
+    n_floored = sum(sesoi_was_floored, na.rm = TRUE),
+    n_capped = sum(sesoi_was_capped, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+manifest[["03_sesoi_subj_channel"]] <- save_table(
+  sesoi_subj_channel,
+  "03_sesoi_subj_channel"
+)
+manifest[["03_sesoi_distribution"]] <- save_table(
+  sesoi_distribution,
+  "03_sesoi_distribution"
+)
+
+kable(sesoi_distribution, digits = 3)
+```
+
+# Observed consecutive R-peak changes
+
+```{r observed-consecutive-changes}
+clean_obs_consec <- full15_rpeak %>%
+  select(dataset, participant, subID, method, channel, clean, components_removed, cleaning_level, rpeak) %>%
+  group_by(dataset, participant, method, channel, clean, components_removed) %>%
+  summarise(
+    rpeak = mean(rpeak, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    sesoi_subj_channel %>%
+      select(dataset, participant, channel, initial_subj, sesoi, sesoi_raw, sesoi_definition),
+    by = c("dataset", "participant", "channel")
+  ) %>%
+  group_by(dataset, participant, method, channel) %>%
+  arrange(components_removed, .by_group = TRUE) %>%
+  mutate(
+    clean_from = clean,
+    clean_to = lead(clean),
+    components_removed_from = components_removed,
+    components_removed_to = lead(components_removed),
+    component_removed = components_removed_to,
+    rpeak_from = rpeak,
+    rpeak_to = lead(rpeak),
+    diff_next_minus_current = rpeak_to - rpeak_from,
+    abs_diff_next_minus_current = abs(diff_next_minus_current),
+    contrast_components = paste0(components_removed_to, " - ", components_removed_from),
+    decrease = diff_next_minus_current < 0,
+    decrease_by_SESOI = diff_next_minus_current < -sesoi,
+    increase_by_SESOI = diff_next_minus_current > sesoi,
+    practically_same = abs(diff_next_minus_current) <= sesoi,
+    transition_class = case_when(
+      decrease_by_SESOI ~ "decrease > SESOI",
+      increase_by_SESOI ~ "increase > SESOI",
+      TRUE ~ "within SESOI"
+    ),
+    transition_class = factor(
+      transition_class,
+      levels = c("decrease > SESOI", "within SESOI", "increase > SESOI")
+    ),
+    diff_sesoi_units = diff_next_minus_current / sesoi,
+    percent_change_from_initial = 100 * diff_next_minus_current / abs(initial_subj),
+    percent_change_from_current = 100 * diff_next_minus_current / abs(rpeak_from)
+  ) %>%
+  filter(!is.na(component_removed)) %>%
+  ungroup()
+
+obs_transition_summary <- clean_obs_consec %>%
+  group_by(method, components_removed_from, components_removed_to, component_removed, contrast_components) %>%
+  summarise(
+    n_participant_channel_cells = n(),
+    n_participants = n_distinct(participant),
+    n_channels = n_distinct(channel),
+    pct_decrease = 100 * mean(decrease, na.rm = TRUE),
+    pct_decrease_by_SESOI = 100 * mean(decrease_by_SESOI, na.rm = TRUE),
+    pct_practically_same = 100 * mean(practically_same, na.rm = TRUE),
+    pct_increase_by_SESOI = 100 * mean(increase_by_SESOI, na.rm = TRUE),
+    median_diff = median(diff_next_minus_current, na.rm = TRUE),
+    q25_diff = safe_q(diff_next_minus_current, 0.25),
+    q75_diff = safe_q(diff_next_minus_current, 0.75),
+    median_diff_sesoi_units = median(diff_sesoi_units, na.rm = TRUE),
+    q25_diff_sesoi_units = safe_q(diff_sesoi_units, 0.25),
+    q75_diff_sesoi_units = safe_q(diff_sesoi_units, 0.75),
+    median_percent_change_from_initial = median(percent_change_from_initial, na.rm = TRUE),
+    median_percent_change_from_current = median(percent_change_from_current, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(method, component_removed)
+
+obs_transition_summary_display <- obs_transition_summary %>%
+  select(
+    method,
+    component_removed,
+    n_participant_channel_cells,
+    pct_decrease_by_SESOI,
+    pct_practically_same,
+    pct_increase_by_SESOI,
+    median_diff_sesoi_units,
+    q25_diff_sesoi_units,
+    q75_diff_sesoi_units
+  )
+
+manifest[["04_clean_obs_consec"]] <- save_table(
+  clean_obs_consec %>%
+    select(
+      dataset,
+      participant,
+      method,
+      channel,
+      components_removed_from,
+      components_removed_to,
+      component_removed,
+      rpeak_from,
+      rpeak_to,
+      diff_next_minus_current,
+      sesoi,
+      diff_sesoi_units,
+      decrease_by_SESOI,
+      practically_same,
+      increase_by_SESOI,
+      transition_class
+    ),
+  "04_clean_obs_consec",
+  csv = FALSE
+)
+manifest[["04_obs_transition_summary"]] <- save_table(
+  obs_transition_summary,
+  "04_obs_transition_summary"
+)
+manifest[["04_obs_transition_summary_display"]] <- save_table(
+  obs_transition_summary_display,
+  "04_obs_transition_summary_display"
+)
+
+kable(obs_transition_summary_display, digits = 2)
+```
+
+```{r observed-transition-plot}
+transition_plot_data <- obs_transition_summary %>%
+  select(
+    method,
+    component_removed,
+    pct_decrease_by_SESOI,
+    pct_practically_same,
+    pct_increase_by_SESOI
+  ) %>%
+  pivot_longer(
+    cols = starts_with("pct_"),
+    names_to = "transition_type",
+    values_to = "percent"
+  ) %>%
+  mutate(
+    transition_type = recode(
+      transition_type,
+      pct_decrease_by_SESOI = "decrease > SESOI",
+      pct_practically_same = "within SESOI",
+      pct_increase_by_SESOI = "increase > SESOI"
+    ),
+    transition_type = factor(
+      transition_type,
+      levels = c("decrease > SESOI", "within SESOI", "increase > SESOI")
+    )
+  )
+
+p_transition_classes <- ggplot(
+  transition_plot_data,
+  aes(x = component_removed, y = percent, fill = transition_type)
+) +
+  geom_col(width = 0.8, colour = "white", linewidth = 0.2) +
+  facet_wrap(~ method, nrow = 1) +
+  scale_fill_manual(values = transition_cols, drop = FALSE) +
+  scale_x_continuous(breaks = sort(unique(transition_plot_data$component_removed))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    x = "Component removed",
+    y = "% participant × EEG-channel observations",
+    fill = "Consecutive change",
+    title = "Observed consecutive R-peak changes",
+    subtitle = "Each bar classifies the change produced by removing one additional component"
+  ) +
+  theme_pub
+
+p_transition_classes
+save_plot_both(
+  p_transition_classes,
+  "01_observed_transition_classes",
+  width = 8,
+  height = 4.2
+)
+```
+
+# Participant × EEG-channel stopping definitions
+
+```{r participant-channel-stopping}
+stopping_points_subj <- clean_obs_consec %>%
+  group_by(dataset, participant, method, channel) %>%
+  arrange(components_removed_from, .by_group = TRUE) %>%
+  summarise(
+    initial_subj = first(initial_subj),
+    sesoi = first(sesoi),
+    sesoi_raw = first(sesoi_raw),
+    sesoi_definition = first(sesoi_definition),
+    n_transitions = n(),
+    n_useful_improvements = sum(decrease_by_SESOI, na.rm = TRUE),
+    n_plateau_steps = sum(practically_same, na.rm = TRUE),
+    n_harmful_steps = sum(increase_by_SESOI, na.rm = TRUE),
+    first_nonuseful_components = first_true_value(
+      components_removed_from,
+      !decrease_by_SESOI,
+      max(components_removed_to, na.rm = TRUE)
+    ),
+    last_meaningful_component = last_true_value(
+      component_removed,
+      decrease_by_SESOI,
+      0L
+    ),
+    first_plateau_component = first_true_value(
+      component_removed,
+      practically_same,
+      NA_integer_
+    ),
+    first_harm_component = first_true_value(
+      component_removed,
+      increase_by_SESOI,
+      NA_integer_
+    ),
+    median_step_diff_sesoi_units = median(diff_sesoi_units, na.rm = TRUE),
+    q25_step_diff_sesoi_units = safe_q(diff_sesoi_units, 0.25),
+    q75_step_diff_sesoi_units = safe_q(diff_sesoi_units, 0.75),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    retained_components_first_nonuseful = first_nonuseful_components,
+    retained_components_after_last_meaningful = last_meaningful_component
+  )
+
+all_meaningful_candidates <- clean_obs_consec %>%
+  filter(decrease_by_SESOI) %>%
+  group_by(dataset, participant, method, channel) %>%
+  summarise(
+    n_all_meaningful_candidates = n(),
+    meaningful_candidate_components = paste(sort(unique(component_removed)), collapse = ","),
+    .groups = "drop"
+  )
+
+stopping_points_subj_report <- stopping_points_subj %>%
+  left_join(
+    all_meaningful_candidates,
+    by = c("dataset", "participant", "method", "channel")
+  ) %>%
+  mutate(
+    n_all_meaningful_candidates = replace_na(n_all_meaningful_candidates, 0L),
+    meaningful_candidate_components = replace_na(meaningful_candidate_components, "")
+  ) %>%
+  select(
+    participant,
+    method,
+    channel,
+    initial_subj,
+    sesoi,
+    n_useful_improvements,
+    n_all_meaningful_candidates,
+    meaningful_candidate_components,
+    n_plateau_steps,
+    n_harmful_steps,
+    retained_components_first_nonuseful,
+    retained_components_after_last_meaningful,
+    first_plateau_component,
+    first_harm_component
+  ) %>%
+  arrange(method, participant, channel)
+
+manifest[["05_stopping_points_subj"]] <- save_table(
+  stopping_points_subj,
+  "05_stopping_points_subj",
+  csv = FALSE
+)
+manifest[["05_all_meaningful_candidates"]] <- save_table(
+  all_meaningful_candidates,
+  "05_all_meaningful_candidates"
+)
+manifest[["05_stopping_points_subj_report"]] <- save_table(
+  stopping_points_subj_report,
+  "05_stopping_points_subj_report"
+)
+
+kable(head(stopping_points_subj_report, 20), digits = 2)
+```
+
+## Compact stopping summaries
+
+```{r stopping-summaries}
+stopping_points_subj_summary <- stopping_points_subj %>%
+  group_by(method) %>%
+  summarise(
+    n_participant_channel_cells = n(),
+    n_participants = n_distinct(participant),
+    n_channels = n_distinct(channel),
+    median_retained_components_first_nonuseful = median(retained_components_first_nonuseful, na.rm = TRUE),
+    mode_retained_components_first_nonuseful = mode_int(retained_components_first_nonuseful),
+    q25_retained_components_first_nonuseful = safe_q(retained_components_first_nonuseful, 0.25),
+    q75_retained_components_first_nonuseful = safe_q(retained_components_first_nonuseful, 0.75),
+    median_retained_components_after_last_meaningful = median(retained_components_after_last_meaningful, na.rm = TRUE),
+    mode_retained_components_after_last_meaningful = mode_int(retained_components_after_last_meaningful),
+    q25_retained_components_after_last_meaningful = safe_q(retained_components_after_last_meaningful, 0.25),
+    q75_retained_components_after_last_meaningful = safe_q(retained_components_after_last_meaningful, 0.75),
+    pct_stop_at_0_after_last_meaningful = 100 * mean(retained_components_after_last_meaningful == 0, na.rm = TRUE),
+    pct_stop_2_to_4_after_last_meaningful = 100 * mean(retained_components_after_last_meaningful %in% 2:4, na.rm = TRUE),
+    pct_stop_3_to_5_after_last_meaningful = 100 * mean(retained_components_after_last_meaningful %in% 3:5, na.rm = TRUE),
+    pct_stop_4_to_6_after_last_meaningful = 100 * mean(retained_components_after_last_meaningful %in% 4:6, na.rm = TRUE),
+    pct_stop_10_or_more_after_last_meaningful = 100 * mean(retained_components_after_last_meaningful >= 10, na.rm = TRUE),
+    pct_stop_at_max_after_last_meaningful = 100 * mean(
+      retained_components_after_last_meaningful == max(retained_components_after_last_meaningful, na.rm = TRUE),
+      na.rm = TRUE
+    ),
+    median_n_useful_improvements = median(n_useful_improvements, na.rm = TRUE),
+    median_n_plateau_steps = median(n_plateau_steps, na.rm = TRUE),
+    median_n_harmful_steps = median(n_harmful_steps, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+manifest[["06_stopping_points_subj_summary"]] <- save_table(
+  stopping_points_subj_summary,
+  "06_stopping_points_subj_summary"
+)
+
+kable(stopping_points_subj_summary, digits = 2)
+```
+
+## Long-format stopping-rule table
+
+```{r stopping-rule-long-table}
+stop_rule_data <- stopping_points_subj_report %>%
+  transmute(
+    participant,
+    method,
+    channel,
+    `First non-useful` = retained_components_first_nonuseful,
+    `Last meaningful` = retained_components_after_last_meaningful,
+    `All meaningful candidates` = n_all_meaningful_candidates
+  ) %>%
+  pivot_longer(
+    cols = c(`First non-useful`, `Last meaningful`, `All meaningful candidates`),
+    names_to = "stopping_rule",
+    values_to = "n_components"
+  ) %>%
+  mutate(
+    stopping_rule = factor(
+      stopping_rule,
+      levels = c("First non-useful", "Last meaningful", "All meaningful candidates")
+    )
+  ) %>%
+  filter(is.finite(n_components), n_components >= 0)
+
+stopping_rule_counts <- stop_rule_data %>%
+  count(method, stopping_rule, n_components, name = "n_participant_channels") %>%
+  group_by(method, stopping_rule) %>%
+  mutate(
+    percent_participant_channels = 100 * n_participant_channels / sum(n_participant_channels)
+  ) %>%
+  ungroup() %>%
+  arrange(method, stopping_rule, n_components)
+
+stopping_rule_summary <- stop_rule_data %>%
+  group_by(method, stopping_rule) %>%
+  summarise(
+    n_participant_channel_cells = n(),
+    median_n_components = median(n_components, na.rm = TRUE),
+    mode_n_components = mode_int(n_components),
+    q25_n_components = safe_q(n_components, 0.25),
+    q75_n_components = safe_q(n_components, 0.75),
+    pct_zero_components = 100 * mean(n_components == 0, na.rm = TRUE),
+    pct_1_to_3_components = 100 * mean(n_components %in% 1:3, na.rm = TRUE),
+    pct_2_to_4_components = 100 * mean(n_components %in% 2:4, na.rm = TRUE),
+    pct_3_to_5_components = 100 * mean(n_components %in% 3:5, na.rm = TRUE),
+    pct_4_to_6_components = 100 * mean(n_components %in% 4:6, na.rm = TRUE),
+    pct_10_or_more_components = 100 * mean(n_components >= 10, na.rm = TRUE),
+    pct_15_components = 100 * mean(n_components == 15, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+manifest[["07_stop_rule_data"]] <- save_table(
+  stop_rule_data,
+  "07_stop_rule_data"
+)
+manifest[["07_stopping_rule_counts"]] <- save_table(
+  stopping_rule_counts,
+  "07_stopping_rule_counts"
+)
+manifest[["07_stopping_rule_summary"]] <- save_table(
+  stopping_rule_summary,
+  "07_stopping_rule_summary"
+)
+
+kable(stopping_rule_summary, digits = 2)
+```
+
+```{r stopping-rule-plots}
+make_stopping_hist <- function(data, rule_keep, title = NULL, x_label = "Number of components") {
+  plot_data <- data %>% filter(stopping_rule == rule_keep)
+  
+  ggplot(plot_data, aes(x = factor(n_components), fill = method)) +
+    geom_bar(colour = "white", linewidth = 0.25) +
+    facet_wrap(~ method, nrow = 1) +
+    scale_fill_manual(values = method_cols) +
+    labs(
+      title = title,
+      subtitle = "Across participant × EEG-channel observations",
+      x = x_label,
+      y = "Participant × EEG-channel count",
+      fill = "Method"
+    ) +
+    theme_pub +
+    theme(legend.position = "none")
+}
+
+make_stopping_cumulative <- function(data, rule_keep, title = NULL, x_label = "Number of components") {
+  plot_data <- data %>% filter(stopping_rule == rule_keep)
+  max_components <- max(plot_data$n_components, na.rm = TRUE)
+  
+  cumulative_data <- plot_data %>%
+    tidyr::crossing(component = 0:max_components) %>%
+    mutate(retained_or_counted = n_components >= component) %>%
+    group_by(method, component) %>%
+    summarise(
+      pct_participant_channels = 100 * mean(retained_or_counted, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  ggplot(cumulative_data, aes(x = component, y = pct_participant_channels, colour = method)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.8) +
+    scale_colour_manual(values = method_cols) +
+    scale_x_continuous(breaks = 0:max_components) +
+    scale_y_continuous(limits = c(0, 100)) +
+    labs(
+      title = title,
+      subtitle = "Across participant × EEG-channel observations",
+      x = x_label,
+      y = "% participant × EEG-channel observations",
+      colour = "Method"
+    ) +
+    theme_pub
+}
+
+p_hist_first_nonuseful <- make_stopping_hist(
+  stop_rule_data,
+  rule_keep = "First non-useful",
+  title = "Stopping rule: first non-useful component",
+  x_label = "Components retained before first non-useful step"
+)
+
+p_hist_last_meaningful <- make_stopping_hist(
+  stop_rule_data,
+  rule_keep = "Last meaningful",
+  title = "Stopping rule: last meaningful component",
+  x_label = "Last SESOI-meaningful component retained"
+)
+
+p_hist_all_candidates <- make_stopping_hist(
+  stop_rule_data,
+  rule_keep = "All meaningful candidates",
+  title = "Number of SESOI-meaningful component candidates",
+  x_label = "Number of meaningful component-removal steps"
+)
+
+p_cum_first_nonuseful <- make_stopping_cumulative(
+  stop_rule_data,
+  rule_keep = "First non-useful",
+  title = "Cumulative profile: first non-useful rule",
+  x_label = "At least this many retained components"
+)
+
+p_cum_last_meaningful <- make_stopping_cumulative(
+  stop_rule_data,
+  rule_keep = "Last meaningful",
+  title = "Cumulative profile: last meaningful rule",
+  x_label = "At least this many retained components"
+)
+
+p_cum_all_candidates <- make_stopping_cumulative(
+  stop_rule_data,
+  rule_keep = "All meaningful candidates",
+  title = "Cumulative profile: all meaningful component candidates",
+  x_label = "At least this many meaningful component-removal steps"
+)
+
+p_hist_first_nonuseful
+p_hist_last_meaningful
+p_hist_all_candidates
+p_cum_first_nonuseful
+p_cum_last_meaningful
+p_cum_all_candidates
+
+save_plot_both(p_hist_first_nonuseful, "02_hist_first_nonuseful", width = 7, height = 4)
+save_plot_both(p_hist_last_meaningful, "03_hist_last_meaningful", width = 7, height = 4)
+save_plot_both(p_hist_all_candidates, "04_hist_all_meaningful_candidates", width = 7, height = 4)
+save_plot_both(p_cum_first_nonuseful, "05_cumulative_first_nonuseful", width = 7, height = 4)
+save_plot_both(p_cum_last_meaningful, "06_cumulative_last_meaningful", width = 7, height = 4)
+save_plot_both(p_cum_all_candidates, "07_cumulative_all_meaningful_candidates", width = 7, height = 4)
+```
+
+# All SESOI-meaningful component candidates by component index
+
+The previous plots summarise stopping rules or the **number** of meaningful candidate steps per participant × EEG-channel observation. The plots below ask a more direct question: **which exact component removals produced SESOI-meaningful R-peak improvements**, irrespective of whether earlier plateaus had already occurred.
+
+```{r all-meaningful-candidate-events}
+all_meaningful_candidate_events <- clean_obs_consec %>%
+  filter(decrease_by_SESOI) %>%
+  transmute(
+    dataset = as.character(dataset),
+    participant = as.character(participant),
+    method = factor(method, levels = c("ICA", "CCA")),
+    channel = as.character(channel),
+    component_removed = as.integer(component_removed)
+  ) %>%
+  distinct(
+    dataset,
+    participant,
+    method,
+    channel,
+    component_removed
+  )
+
+all_meaningful_candidate_pct <- clean_obs_consec %>%
+  mutate(
+    method = factor(method, levels = c("ICA", "CCA")),
+    component_removed = as.integer(component_removed)
+  ) %>%
+  group_by(method, component_removed) %>%
+  summarise(
+    n_participant_channels = n(),
+    n_meaningful = sum(decrease_by_SESOI, na.rm = TRUE),
+    pct_meaningful = 100 * mean(decrease_by_SESOI, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(method, component_removed)
+
+all_meaningful_candidate_event_counts <- all_meaningful_candidate_events %>%
+  count(method, component_removed, name = "n_meaningful_participant_channels") %>%
+  group_by(method) %>%
+  mutate(
+    pct_of_all_meaningful_events =
+      100 * n_meaningful_participant_channels / sum(n_meaningful_participant_channels),
+    cumulative_pct_of_all_meaningful_events =
+      cumsum(pct_of_all_meaningful_events)
+  ) %>%
+  ungroup()
+
+manifest[["08_all_meaningful_candidate_events"]] <- save_table(
+  all_meaningful_candidate_events,
+  "08_all_meaningful_candidate_events"
+)
+manifest[["08_all_meaningful_candidate_pct_by_component"]] <- save_table(
+  all_meaningful_candidate_pct,
+  "08_all_meaningful_candidate_pct_by_component"
+)
+manifest[["08_all_meaningful_candidate_event_counts"]] <- save_table(
+  all_meaningful_candidate_event_counts,
+  "08_all_meaningful_candidate_event_counts"
+)
+
+kable(all_meaningful_candidate_pct, digits = 2)
+```
+
+```{r all-meaningful-candidate-event-plots}
+p_hist_all_candidates_events <- ggplot(
+  all_meaningful_candidate_events,
+  aes(x = factor(component_removed), fill = method)
+) +
+  geom_bar(colour = "white", linewidth = 0.25) +
+  facet_wrap(~ method, nrow = 1) +
+  scale_fill_manual(values = method_cols) +
+  labs(
+    title = "All SESOI-meaningful component candidates",
+    subtitle = "Each bar counts participant × EEG-channel observations where that component removal was meaningful",
+    x = "Component removed",
+    y = "Meaningful participant × EEG-channel count"
+  ) +
+  theme_pub +
+  theme(legend.position = "none")
+
+p_pct_all_candidates_events <- ggplot(
+  all_meaningful_candidate_pct,
+  aes(x = component_removed, y = pct_meaningful, colour = method)
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  scale_colour_manual(values = method_cols) +
+  scale_x_continuous(breaks = sort(unique(all_meaningful_candidate_pct$component_removed))) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(
+    title = "Frequency of SESOI-meaningful improvement by component",
+    subtitle = "Each point shows the percentage of participant × EEG-channel observations",
+    x = "Component removed",
+    y = "% SESOI-meaningful",
+    colour = "Method"
+  ) +
+  theme_pub
+
+p_cum_all_candidates_events <- ggplot(
+  all_meaningful_candidate_event_counts,
+  aes(x = component_removed, y = cumulative_pct_of_all_meaningful_events, colour = method)
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  scale_colour_manual(values = method_cols) +
+  scale_x_continuous(breaks = sort(unique(all_meaningful_candidate_event_counts$component_removed))) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(
+    title = "Cumulative distribution of meaningful component candidates",
+    subtitle = "Cumulative percentage of all SESOI-meaningful candidate events up to each component index",
+    x = "Component removed",
+    y = "Cumulative % of meaningful events",
+    colour = "Method"
+  ) +
+  theme_pub
+
+p_hist_all_candidates_events
+p_pct_all_candidates_events
+p_cum_all_candidates_events
+
+save_plot_both(p_hist_all_candidates_events, "08_hist_all_meaningful_candidate_events_by_component", width = 7, height = 4)
+save_plot_both(p_pct_all_candidates_events, "09_pct_all_meaningful_candidate_events_by_component", width = 7, height = 4)
+save_plot_both(p_cum_all_candidates_events, "10_cumulative_all_meaningful_candidate_events_by_component", width = 7, height = 4)
+```
+
+# Model-based consecutive contrasts and plateaus
+
+The saved all-channel model uses `cleaning_level` internally as a categorical factor. The public tables below convert this to the number of removed components, so model transitions are displayed as components 1–15.
+
+```{r model-based-stopping, message=FALSE, warning=FALSE}
+model_sesoi_lookup <- sesoi_subj_channel %>%
+  summarise(
+    sesoi_model_median_subject_channel = median(sesoi, na.rm = TRUE),
+    sesoi_model_mean_subject_channel = mean(sesoi, na.rm = TRUE),
+    sesoi_model_q25_subject_channel = safe_q(sesoi, 0.25),
+    sesoi_model_q75_subject_channel = safe_q(sesoi, 0.75),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sesoi_model = case_when(
+      settings$model_sesoi_definition == "mean_subject_channel" ~ sesoi_model_mean_subject_channel,
+      TRUE ~ sesoi_model_median_subject_channel
+    ),
+    sesoi_model_definition = settings$model_sesoi_definition
+  )
+
+model_clean_draws <- tibble()
+model_clean_summary <- tibble()
+model_stopping_points <- tibble()
+
+if (isTRUE(params$run_model_summaries)) {
+  if (!file.exists(settings$model_rpeak_file)) {
+    stop("Cannot find model file: ", basename(settings$model_rpeak_file))
+  }
+  
+  fit_main <- readRDS(settings$model_rpeak_file)
+  
+  emm_clean <- emmeans::emmeans(
+    fit_main,
+    ~ cleaning_level | method,
+    epred = TRUE,
+    re_formula = NA
+  )
+  
+  clean_contrasts <- emmeans::contrast(
+    emm_clean,
+    method = "consec"
+  )
+  
+  model_clean_draws_raw <- tidybayes::gather_emmeans_draws(clean_contrasts) %>%
+    mutate(
+      method = as.character(method),
+      contrast = as.character(contrast)
+    )
+  
+  contrast_parsed <- parse_consec_contrast(model_clean_draws_raw$contrast)
+  
+  model_clean_draws <- bind_cols(model_clean_draws_raw, contrast_parsed) %>%
+    mutate(
+      components_removed_from = clean_from - 1L,
+      components_removed_to = clean_to - 1L,
+      component_removed = components_removed_to,
+      contrast_components = paste0(components_removed_to, " - ", components_removed_from),
+      sesoi_model = model_sesoi_lookup$sesoi_model[[1]],
+      sesoi_model_definition = model_sesoi_lookup$sesoi_model_definition[[1]],
+      diff_sesoi_units = .value / sesoi_model,
+      decrease = .value < 0,
+      decrease_by_SESOI = .value < -sesoi_model,
+      increase_by_SESOI = .value > sesoi_model,
+      practically_same = abs(.value) <= sesoi_model
+    )
+  
+  model_clean_summary <- model_clean_draws %>%
+    group_by(method, components_removed_from, components_removed_to, component_removed, contrast_components) %>%
+    summarise(
+      sesoi_model = first(sesoi_model),
+      sesoi_model_definition = first(sesoi_model_definition),
+      median_diff = median(.value, na.rm = TRUE),
+      lower95_diff = safe_q(.value, 0.025),
+      upper95_diff = safe_q(.value, 0.975),
+      median_diff_sesoi_units = median(diff_sesoi_units, na.rm = TRUE),
+      lower95_diff_sesoi_units = safe_q(diff_sesoi_units, 0.025),
+      upper95_diff_sesoi_units = safe_q(diff_sesoi_units, 0.975),
+      p_decrease = mean(decrease, na.rm = TRUE),
+      p_decrease_by_SESOI = mean(decrease_by_SESOI, na.rm = TRUE),
+      p_practically_same = mean(practically_same, na.rm = TRUE),
+      p_increase_by_SESOI = mean(increase_by_SESOI, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      useful_improvement_model =
+        p_decrease_by_SESOI >= settings$model_useful_p_decrease_by_sesoi_min,
+      likely_plateau_model =
+        p_decrease_by_SESOI <= settings$model_plateau_p_decrease_by_sesoi_max &
+        p_practically_same >= settings$model_plateau_p_same_min,
+      possible_harm_model =
+        p_increase_by_SESOI >= settings$model_harm_p_increase_by_sesoi_min
+    ) %>%
+    arrange(method, component_removed)
+  
+  model_stopping_points <- model_clean_summary %>%
+    group_by(method) %>%
+    arrange(components_removed_from, .by_group = TRUE) %>%
+    summarise(
+      n_transitions = n(),
+      n_useful_model_transitions = sum(useful_improvement_model, na.rm = TRUE),
+      n_likely_plateau_model_transitions = sum(likely_plateau_model, na.rm = TRUE),
+      n_possible_harm_model_transitions = sum(possible_harm_model, na.rm = TRUE),
+      retained_components_model_after_last_useful = last_true_value(
+        component_removed,
+        useful_improvement_model,
+        0L
+      ),
+      retained_components_model_first_nonuseful = first_true_value(
+        components_removed_from,
+        !useful_improvement_model,
+        max(components_removed_to, na.rm = TRUE)
+      ),
+      first_likely_plateau_component_model = first_true_value(
+        component_removed,
+        likely_plateau_model,
+        NA_integer_
+      ),
+      first_possible_harm_component_model = first_true_value(
+        component_removed,
+        possible_harm_model,
+        NA_integer_
+      ),
+      .groups = "drop"
+    )
+}
+
+manifest[["09_model_sesoi_lookup"]] <- save_table(
+  model_sesoi_lookup,
+  "09_model_sesoi_lookup"
+)
+
+if (nrow(model_clean_summary) > 0) {
+  manifest[["09_model_clean_summary"]] <- save_table(
+    model_clean_summary,
+    "09_model_clean_summary"
+  )
+  manifest[["09_model_stopping_points"]] <- save_table(
+    model_stopping_points,
+    "09_model_stopping_points"
+  )
+}
+
+kable(model_sesoi_lookup, digits = 3)
+if (nrow(model_clean_summary) > 0) kable(model_clean_summary, digits = 3)
+if (nrow(model_stopping_points) > 0) kable(model_stopping_points, digits = 2)
+```
+
+```{r model-plots, eval=TRUE}
+if (nrow(model_clean_summary) > 0) {
+  p_model_diff <- ggplot(
+    model_clean_summary,
+    aes(x = component_removed, y = median_diff_sesoi_units, colour = method)
+  ) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = cca_pal$zero) +
+    geom_hline(yintercept = -1, linetype = "dotted", colour = cca_pal$mid_grey) +
+    geom_linerange(aes(ymin = lower95_diff_sesoi_units, ymax = upper95_diff_sesoi_units), linewidth = 0.7) +
+    geom_point(size = 2) +
+    geom_line(linewidth = 0.8) +
+    scale_colour_manual(values = method_cols) +
+    scale_x_continuous(breaks = sort(unique(model_clean_summary$component_removed))) +
+    labs(
+      x = "Component removed",
+      y = "Consecutive model contrast in SESOI units",
+      colour = "Method",
+      title = "Model-estimated consecutive R-peak changes",
+      subtitle = "Negative values indicate R-peak reduction; dotted line marks one SESOI decrease"
+    ) +
+    theme_pub
+  
+  p_model_probs <- model_clean_summary %>%
+    select(method, component_removed, p_decrease_by_SESOI, p_practically_same, p_increase_by_SESOI) %>%
+    pivot_longer(
+      cols = starts_with("p_"),
+      names_to = "probability_type",
+      values_to = "probability"
+    ) %>%
+    mutate(
+      probability_type = recode(
+        probability_type,
+        p_decrease_by_SESOI = "P(decrease > SESOI)",
+        p_practically_same = "P(within SESOI)",
+        p_increase_by_SESOI = "P(increase > SESOI)"
+      ),
+      probability_type = factor(
+        probability_type,
+        levels = c("P(decrease > SESOI)", "P(within SESOI)", "P(increase > SESOI)")
+      )
+    ) %>%
+    ggplot(aes(x = component_removed, y = probability, colour = probability_type)) +
+    geom_hline(yintercept = 0.80, linetype = "dashed", colour = cca_pal$mid_grey) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.8) +
+    facet_wrap(~ method, nrow = 1) +
+    scale_colour_manual(values = probability_cols, drop = FALSE) +
+    scale_y_continuous(limits = c(0, 1)) +
+    scale_x_continuous(breaks = sort(unique(model_clean_summary$component_removed))) +
+    labs(
+      x = "Component removed",
+      y = "Posterior probability",
+      colour = "Model probability",
+      title = "Model evidence for useful improvement, plateau, and harm",
+      subtitle = "Dashed line marks the 0.80 decision threshold"
+    ) +
+    theme_pub
+  
+  print(p_model_diff)
+  print(p_model_probs)
+  save_plot_both(p_model_diff, "11_model_consecutive_differences", width = 7, height = 4.2)
+  save_plot_both(p_model_probs, "12_model_probabilities", width = 8, height = 4.2)
+}
+```
+
+# Text-ready result stubs
+
+```{r text-ready-stubs}
+observed_transition_stubs <- obs_transition_summary %>%
+  group_by(method) %>%
+  summarise(
+    first_component_pct_decrease_by_SESOI = pct_decrease_by_SESOI[component_removed == 1][1],
+    first_component_pct_same = pct_practically_same[component_removed == 1][1],
+    first_component_median_diff_sesoi = median_diff_sesoi_units[component_removed == 1][1],
+    max_pct_decrease_by_SESOI = max(pct_decrease_by_SESOI, na.rm = TRUE),
+    component_with_max_pct_decrease_by_SESOI = component_removed[which.max(pct_decrease_by_SESOI)][1],
+    .groups = "drop"
+  ) %>%
+  transmute(
+    topic = "observed_consecutive_changes",
+    method,
+    sentence_stub = sprintf(
+      "%s: the first removed component produced a SESOI-meaningful R-peak decrease in %.1f%% of participant × EEG-channel observations (%.1f%% within SESOI; median step change %.2f SESOI units). The highest observed share of SESOI-meaningful decreases was %.1f%% at component %d.",
+      method,
+      first_component_pct_decrease_by_SESOI,
+      first_component_pct_same,
+      first_component_median_diff_sesoi,
+      max_pct_decrease_by_SESOI,
+      component_with_max_pct_decrease_by_SESOI
+    )
+  )
+
+stopping_rule_stubs <- stopping_rule_summary %>%
+  transmute(
+    topic = "stopping_rule_summary",
+    method,
+    stopping_rule,
+    sentence_stub = sprintf(
+      "%s, %s rule: median components = %.1f (IQR %.1f–%.1f; mode %d); %.1f%% of participant × EEG-channel observations fell in the 3–5 component range, %.1f%% in the 4–6 range, and %.1f%% at 10 or more components.",
+      method,
+      as.character(stopping_rule),
+      median_n_components,
+      q25_n_components,
+      q75_n_components,
+      mode_n_components,
+      pct_3_to_5_components,
+      pct_4_to_6_components,
+      pct_10_or_more_components
+    )
+  )
+
+component_candidate_stubs <- all_meaningful_candidate_pct %>%
+  group_by(method) %>%
+  summarise(
+    component_with_max_pct_meaningful = component_removed[which.max(pct_meaningful)][1],
+    max_pct_meaningful = max(pct_meaningful, na.rm = TRUE),
+    pct_component_1 = pct_meaningful[component_removed == 1][1],
+    pct_component_2 = pct_meaningful[component_removed == 2][1],
+    pct_component_3 = pct_meaningful[component_removed == 3][1],
+    pct_component_4 = pct_meaningful[component_removed == 4][1],
+    .groups = "drop"
+  ) %>%
+  transmute(
+    topic = "all_meaningful_candidates_by_component",
+    method,
+    sentence_stub = sprintf(
+      "%s: SESOI-meaningful candidate events occurred in %.1f%%, %.1f%%, %.1f%%, and %.1f%% of observations for components 1–4, respectively; the maximum was %.1f%% at component %d.",
+      method,
+      pct_component_1,
+      pct_component_2,
+      pct_component_3,
+      pct_component_4,
+      max_pct_meaningful,
+      component_with_max_pct_meaningful
+    )
+  )
+
+model_stubs <- if (nrow(model_stopping_points) > 0) {
+  model_stopping_points %>%
+    transmute(
+      topic = "model_based_stopping",
+      method,
+      stopping_rule = NA_character_,
+      sentence_stub = sprintf(
+        "%s model-based stopping: %d transitions met the useful-improvement rule; first non-useful retained components = %d, after-last-useful retained components = %d, and first likely plateau component = %s.",
+        method,
+        n_useful_model_transitions,
+        retained_components_model_first_nonuseful,
+        retained_components_model_after_last_useful,
+        ifelse(is.na(first_likely_plateau_component_model), "NA", as.character(first_likely_plateau_component_model))
+      )
+    )
+} else {
+  tibble(
+    topic = "model_based_stopping",
+    method = NA_character_,
+    stopping_rule = NA_character_,
+    sentence_stub = "Model summaries were not run."
+  )
+}
+
+manuscript_stubs <- bind_rows(
+  observed_transition_stubs %>% mutate(stopping_rule = NA_character_),
+  stopping_rule_stubs,
+  component_candidate_stubs %>% mutate(stopping_rule = NA_character_),
+  model_stubs
+) %>%
+  select(topic, method, stopping_rule, sentence_stub)
+
+manifest[["10_manuscript_sentence_stubs"]] <- save_table(
+  manuscript_stubs,
+  "10_manuscript_sentence_stubs"
+)
+
+kable(manuscript_stubs)
+```
+
+# Save compact analysis bundle and manifest
+
+```{r save-bundle-and-manifest, echo=FALSE, message=FALSE}
+settings_public <- settings
+settings_public$model_rpeak_file <- basename(settings_public$model_rpeak_file)
+
+stopping_analysis_bundle <- list(
+  settings = settings_public,
+  sample_accounting = sample_accounting,
+  sesoi_distribution = sesoi_distribution,
+  obs_transition_summary = obs_transition_summary,
+  obs_transition_summary_display = obs_transition_summary_display,
+  stopping_points_subj_summary = stopping_points_subj_summary,
+  stopping_rule_summary = stopping_rule_summary,
+  stopping_rule_counts = stopping_rule_counts,
+  all_meaningful_candidate_pct = all_meaningful_candidate_pct,
+  all_meaningful_candidate_event_counts = all_meaningful_candidate_event_counts,
+  model_sesoi_lookup = model_sesoi_lookup,
+  model_clean_summary = model_clean_summary,
+  model_stopping_points = model_stopping_points,
+  manuscript_stubs = manuscript_stubs
+)
+
+saveRDS(stopping_analysis_bundle, file.path(outpath, "11_stopping_analysis_bundle.rds"))
+manifest[["11_stopping_analysis_bundle"]] <- tibble(
+  name = "11_stopping_analysis_bundle",
+  rds = file.path(outpath, "11_stopping_analysis_bundle.rds"),
+  csv = NA_character_,
+  n_rows = NA_integer_
+)
+
+manifest_df <- bind_rows(manifest) %>%
+  arrange(name) %>%
+  mutate(created_at = Sys.time())
+
+manifest_public <- manifest_df %>%
+  mutate(
+    rds = if_else(is.na(rds), NA_character_, basename(rds)),
+    csv = if_else(is.na(csv), NA_character_, basename(csv))
+  )
+
+utils::write.csv(manifest_public, file.path(outpath, "99_manifest.csv"), row.names = FALSE)
+saveRDS(manifest_public, file.path(outpath, "99_manifest.rds"))
+
+cat("Manifest saved as 99_manifest.rds and 99_manifest.csv.\n")
+
+if (isTRUE(params$show_manifest)) {
+  kable(manifest_public)
+}
+```

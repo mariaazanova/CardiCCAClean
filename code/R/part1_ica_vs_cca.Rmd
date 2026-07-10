@@ -1,0 +1,1250 @@
+---
+title: "Part 1 — ICA vs CCA: R-peak prominence and alpha power preservation"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  sesoi_prop: 0.05
+  refit_models: false
+  run_model_summaries: true
+  save_figures: true
+  show_manifest: false
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(purrr)
+  library(stringr)
+  library(ggplot2)
+  library(knitr)
+  library(brms)
+  library(emmeans)
+  library(tidybayes)
+  library(cmdstanr)
+  library(rstudioapi)
+  library(rlang)
+  library(R.matlab)
+})
+
+codepath <- dirname(rstudioapi::getSourceEditorContext()$path)
+project_root <- dirname(dirname(codepath))
+datapath <- file.path(project_root, "data")
+vispath <- file.path(project_root, "vis")
+modelpath <- file.path(datapath, "models")
+
+outpath <- file.path(datapath, "results_markdown", "part1_ica_vs_cca")
+figpath <- file.path(vispath, "results", "part1_ica_vs_cca")
+dir.create(outpath, recursive = TRUE, showWarnings = FALSE)
+dir.create(figpath, recursive = TRUE, showWarnings = FALSE)
+
+source(file.path(codepath, "data_loading_functions.R"))
+
+settings <- list(
+  sesoi_prop = params$sesoi_prop,
+  methods_keep = c("ICA", "CCA"),
+  clean_baseline = 1L,
+  # clean = 1 is no component removed, so it is excluded from observed method counts.
+  exclude_baseline_from_method_counts = TRUE,
+  model_rpeak_file = file.path(modelpath, "main_all_channels.rds"),
+  model_alpha_file = file.path(modelpath, "alpha_all_channels.rds")
+)
+
+safe_q <- function(x, p) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  unname(stats::quantile(x, probs = p, na.rm = TRUE))
+}
+
+safe_mean <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  mean(x)
+}
+
+safe_median <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  median(x)
+}
+
+fmt_num <- function(x, digits = 2) {
+  x <- as.numeric(x)
+  ifelse(
+    is.na(x),
+    "NA",
+    formatC(x, format = "f", digits = digits)
+  )
+}
+
+fmt_pct <- function(x, digits = 1) {
+  x <- as.numeric(x)
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(formatC(x, format = "f", digits = digits), "%")
+  )
+}
+
+`%||%` <- function(x, y) {
+  if (is.null(x)) y else x
+}
+
+save_table <- function(x, name, csv = TRUE) {
+  rds_file <- file.path(outpath, paste0(name, ".rds"))
+  saveRDS(x, rds_file)
+  csv_file <- NA_character_
+  if (csv) {
+    csv_file <- file.path(outpath, paste0(name, ".csv"))
+    utils::write.csv(x, csv_file, row.names = FALSE)
+  }
+  tibble(name = name, rds = rds_file, csv = csv_file, n_rows = ifelse(is.data.frame(x), nrow(x), NA_integer_))
+}
+
+save_plot_both <- function(plot, name, width = 7, height = 4.5) {
+  if (!isTRUE(params$save_figures)) return(invisible(NULL))
+  ggsave(file.path(figpath, paste0(name, ".pdf")), plot, width = width, height = height, device = cairo_pdf)
+  ggsave(file.path(figpath, paste0(name, ".png")), plot, width = width, height = height, dpi = 300)
+}
+
+fig_font_family <- "Times New Roman"
+
+cca_pal <- list(
+  method = c(
+    "ICA" = "#1D4E89",  # deep blue
+    "CCA" = "#8A1538"   # bordeaux
+  ),
+  highlight = "#39B54A",
+  zero = "#555555",
+  text = "#2B2B2B",
+  grid = "#E8E4DC",
+  strip = "#F3EFE7",
+  light_grey = "#D8D8D8",
+  mid_grey = "#8A8A8A",
+  dark_grey = "#3A3A3A",
+  heat = c("#EFEFEF", "#F6D96B", "#E07A3F", "#B2182B")
+)
+
+method_cols <- cca_pal$method
+class_cols <- c(
+  "CCA better > SESOI" = cca_pal$method[["CCA"]],
+  "similar / within SESOI" = cca_pal$light_grey,
+  "ICA better > SESOI" = cca_pal$method[["ICA"]]
+)
+
+theme_pub <- theme_bw(base_size = 12, base_family = fig_font_family) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9.5),
+    strip.background = element_rect(fill = cca_pal$strip, colour = NA),
+    strip.text = element_text(face = "bold", colour = cca_pal$text),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.25, colour = cca_pal$grid),
+    axis.title = element_text(colour = cca_pal$text),
+    axis.text = element_text(colour = cca_pal$text),
+    plot.title = element_text(face = "bold", size = 12, colour = cca_pal$text),
+    plot.subtitle = element_text(size = 10, colour = cca_pal$text),
+    plot.margin = margin(8, 8, 12, 8)
+  )
+
+manifest <- list()
+```
+
+# Analysis logic
+
+This section compares ICA and CCA using the full 15-channel ECG configuration. 
+
+Main decisions:
+
+1. R-peak prominence: lower values are better.
+2. Alpha power: higher values are interpreted as better signal preservation.
+3. `clean == 1` is the no-cleaning baseline and is displayed as 0 components removed.
+4. Observed ICA–CCA counts exclude the no-cleaning baseline, because the comparison is only meaningful after at least one component has been removed.
+5. SESOI is defined separately for R-peak and alpha power as `r params$sesoi_prop * 100`% of the no-cleaning value for each participant × EEG channel.
+6. Model summaries use the saved all-channel models when available. The all-channel model SESOI is the mean participant × channel baseline multiplied by `r params$sesoi_prop`.
+
+# Load full 15-channel data
+
+```{r load-full15-data, message=FALSE, warning=FALSE}
+load_full15_metric_all_methods <- function(measure = c("rpeak", "alpha_peak")) {
+  measure <- match.arg(measure)
+  value_name <- measure
+  methods_keep <- settings$methods_keep
+  
+  chlabels_data1 <- load_chlabels_dataset("sub_chlabels.mat")
+  chlabels_data2 <- load_chlabels_dataset("sub_chlabels_data2.mat")
+  n_data1 <- length(chlabels_data1)
+  n_data2 <- length(chlabels_data2)
+  participant_levels <- sprintf("P%02d", seq_len(n_data1 + n_data2))
+  
+  df_data1 <- load_full15_rpeak_dataset(
+    data_file = "data4stats.mat",
+    chlabels_by_group = chlabels_data1,
+    dataset = "data1",
+    offset = 0,
+    methods = methods_keep,
+    measure = measure,
+    value_name = value_name
+  )
+  
+  df_data2 <- load_full15_rpeak_dataset(
+    data_file = "data4stats_2.mat",
+    chlabels_by_group = chlabels_data2,
+    dataset = "data2",
+    offset = n_data1,
+    methods = methods_keep,
+    measure = measure,
+    value_name = value_name
+  )
+  
+  bind_rows(df_data1, df_data2) %>%
+    mutate(
+      dataset = as.character(dataset),
+      participant = as.character(participant),
+      subID = factor(subID, levels = participant_levels),
+      method = factor(method, levels = c("ICA", "CCA")),
+      clean = as.integer(clean),
+      components_removed = clean - 1L,
+      cleaning_level = factor(clean, levels = sort(unique(clean))),
+      components_removed_factor = factor(components_removed, levels = sort(unique(components_removed))),
+      channel = as.character(channel)
+    )
+}
+
+full15_rpeak <- load_full15_metric_all_methods("rpeak")
+full15_alpha <- load_full15_metric_all_methods("alpha_peak") %>%
+  mutate(
+    alpha_power = alpha_peak,
+    alpha_power_db = if_else(alpha_power > 0, 10 * log10(alpha_power), NA_real_)
+  )
+
+manifest[["01_full15_rpeak_light"]] <- save_table(full15_rpeak, "01_full15_rpeak_light", csv = FALSE)
+manifest[["01_full15_alpha_light"]] <- save_table(full15_alpha, "01_full15_alpha_light", csv = FALSE)
+```
+
+```{r sample-accounting}
+make_sample_accounting <- function(df, value_col) {
+  df %>%
+    filter(is.finite(.data[[value_col]])) %>%
+    distinct(dataset, participant, channel) %>%
+    summarise(
+      n_participants = n_distinct(participant),
+      n_participant_channel_cells = n(),
+      n_unique_channels = n_distinct(channel),
+      median_channels_per_participant = median(table(participant)),
+      min_channels_per_participant = min(table(participant)),
+      max_channels_per_participant = max(table(participant)),
+      .groups = "drop"
+    )
+}
+
+sample_accounting <- bind_rows(
+  make_sample_accounting(full15_rpeak, "rpeak") %>% mutate(measure = "rpeak"),
+  make_sample_accounting(full15_alpha, "alpha_power") %>% mutate(measure = "alpha_power")
+) %>% relocate(measure)
+
+manifest[["02_sample_accounting"]] <- save_table(sample_accounting, "02_sample_accounting")
+
+kable(sample_accounting, digits = 2)
+```
+
+# Helper functions for observed ICA–CCA comparisons
+
+```{r observed-helper-functions}
+make_sesoi_reference <- function(df, value_col, measure_name) {
+  df %>%
+    filter(clean == settings$clean_baseline) %>%
+    group_by(dataset, participant, channel) %>%
+    summarise(
+      baseline_value = mean(.data[[value_col]], na.rm = TRUE),
+      n_baseline_values = n(),
+      n_methods_at_baseline = n_distinct(method),
+      sesoi = settings$sesoi_prop * abs(baseline_value),
+      .groups = "drop"
+    ) %>%
+    filter(is.finite(baseline_value), is.finite(sesoi), sesoi > 0) %>%
+    mutate(measure = measure_name)
+}
+
+make_observed_method_pairs <- function(df, value_col, measure_name, lower_is_better = TRUE) {
+  sesoi_ref <- make_sesoi_reference(df, value_col, measure_name)
+  
+  df_pairs <- df %>%
+    { if (settings$exclude_baseline_from_method_counts) filter(., clean != settings$clean_baseline) else . } %>%
+    select(
+      dataset, participant, channel, clean, components_removed,
+      cleaning_level, method, value = all_of(value_col)
+    ) %>%
+    filter(is.finite(value)) %>%
+    pivot_wider(names_from = method, values_from = value) %>%
+    filter(is.finite(ICA), is.finite(CCA)) %>%
+    left_join(sesoi_ref, by = c("dataset", "participant", "channel")) %>%
+    mutate(
+      measure = measure_name,
+      diff_cca_minus_ica = CCA - ICA,
+      abs_diff_cca_minus_ica = abs(diff_cca_minus_ica),
+      pct_diff_vs_ica = if_else(abs(ICA) > 0, 100 * diff_cca_minus_ica / abs(ICA), NA_real_),
+      pct_reduction_vs_ica = if_else(abs(ICA) > 0, 100 * (ICA - CCA) / abs(ICA), NA_real_),
+      pct_increase_vs_ica = if_else(abs(ICA) > 0, 100 * (CCA - ICA) / abs(ICA), NA_real_),
+      cca_better = if (lower_is_better) diff_cca_minus_ica < 0 else diff_cca_minus_ica > 0,
+      ica_better = if (lower_is_better) diff_cca_minus_ica > 0 else diff_cca_minus_ica < 0,
+      within_sesoi = abs(diff_cca_minus_ica) <= sesoi,
+      cca_better_by_sesoi = if (lower_is_better) diff_cca_minus_ica < -sesoi else diff_cca_minus_ica > sesoi,
+      ica_better_by_sesoi = if (lower_is_better) diff_cca_minus_ica > sesoi else diff_cca_minus_ica < -sesoi,
+      method_sesoi_class = case_when(
+        cca_better_by_sesoi ~ "CCA better > SESOI",
+        ica_better_by_sesoi ~ "ICA better > SESOI",
+        TRUE ~ "similar / within SESOI"
+      ),
+      method_sesoi_class = factor(
+        method_sesoi_class,
+        levels = c("CCA better > SESOI", "similar / within SESOI", "ICA better > SESOI")
+      ),
+      direction = if_else(lower_is_better, "lower is better", "higher is better")
+    )
+  
+  list(pairs = df_pairs, sesoi = sesoi_ref)
+}
+
+summarise_observed_pairs <- function(pairs) {
+  pooled <- pairs %>%
+    summarise(
+      measure = first(measure),
+      direction = first(direction),
+      n_paired_observations = n(),
+      n_participants = n_distinct(participant),
+      n_channels = n_distinct(channel),
+      pct_CCA_better = 100 * mean(cca_better, na.rm = TRUE),
+      pct_CCA_better_by_SESOI = 100 * mean(cca_better_by_sesoi, na.rm = TRUE),
+      pct_similar_within_SESOI = 100 * mean(within_sesoi, na.rm = TRUE),
+      pct_ICA_better_by_SESOI = 100 * mean(ica_better_by_sesoi, na.rm = TRUE),
+      median_diff_CCA_minus_ICA = median(diff_cca_minus_ica, na.rm = TRUE),
+      q25_diff_CCA_minus_ICA = safe_q(diff_cca_minus_ica, 0.25),
+      q75_diff_CCA_minus_ICA = safe_q(diff_cca_minus_ica, 0.75),
+      median_pct_diff_vs_ICA = median(pct_diff_vs_ica, na.rm = TRUE),
+      median_pct_reduction_vs_ICA = median(pct_reduction_vs_ica, na.rm = TRUE),
+      median_pct_increase_vs_ICA = median(pct_increase_vs_ica, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  by_participant <- pairs %>%
+    group_by(measure, participant) %>%
+    summarise(
+      direction = first(direction),
+      n_paired_observations = n(),
+      n_channels = n_distinct(channel),
+      pct_CCA_better = 100 * mean(cca_better, na.rm = TRUE),
+      pct_CCA_better_by_SESOI = 100 * mean(cca_better_by_sesoi, na.rm = TRUE),
+      pct_similar_within_SESOI = 100 * mean(within_sesoi, na.rm = TRUE),
+      pct_ICA_better_by_SESOI = 100 * mean(ica_better_by_sesoi, na.rm = TRUE),
+      median_diff_CCA_minus_ICA = median(diff_cca_minus_ica, na.rm = TRUE),
+      median_pct_diff_vs_ICA = median(pct_diff_vs_ica, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(measure, participant)
+  
+  by_components_removed <- pairs %>%
+    group_by(measure, components_removed) %>%
+    summarise(
+      direction = first(direction),
+      n_paired_observations = n(),
+      n_participants = n_distinct(participant),
+      n_channels = n_distinct(channel),
+      pct_CCA_better = 100 * mean(cca_better, na.rm = TRUE),
+      pct_CCA_better_by_SESOI = 100 * mean(cca_better_by_sesoi, na.rm = TRUE),
+      pct_similar_within_SESOI = 100 * mean(within_sesoi, na.rm = TRUE),
+      pct_ICA_better_by_SESOI = 100 * mean(ica_better_by_sesoi, na.rm = TRUE),
+      median_diff_CCA_minus_ICA = median(diff_cca_minus_ica, na.rm = TRUE),
+      median_pct_diff_vs_ICA = median(pct_diff_vs_ica, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(measure, components_removed)
+  
+  by_channel <- pairs %>%
+    group_by(measure, channel) %>%
+    summarise(
+      direction = first(direction),
+      n_paired_observations = n(),
+      n_participants = n_distinct(participant),
+      pct_CCA_better = 100 * mean(cca_better, na.rm = TRUE),
+      pct_CCA_better_by_SESOI = 100 * mean(cca_better_by_sesoi, na.rm = TRUE),
+      pct_similar_within_SESOI = 100 * mean(within_sesoi, na.rm = TRUE),
+      pct_ICA_better_by_SESOI = 100 * mean(ica_better_by_sesoi, na.rm = TRUE),
+      median_diff_CCA_minus_ICA = median(diff_cca_minus_ica, na.rm = TRUE),
+      median_pct_diff_vs_ICA = median(pct_diff_vs_ica, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(measure, desc(pct_CCA_better_by_SESOI))
+  
+  class_counts <- pairs %>%
+    count(measure, method_sesoi_class, name = "n") %>%
+    group_by(measure) %>%
+    mutate(percent = 100 * n / sum(n)) %>%
+    ungroup()
+  
+  list(
+    pooled = pooled,
+    by_participant = by_participant,
+    by_components_removed = by_components_removed,
+    by_channel = by_channel,
+    class_counts = class_counts
+  )
+}
+```
+
+# Observed ICA–CCA comparison: R-peak prominence
+
+```{r observed-rpeak}
+rpeak_observed <- make_observed_method_pairs(
+  full15_rpeak,
+  value_col = "rpeak",
+  measure_name = "rpeak",
+  lower_is_better = TRUE
+)
+
+rpeak_observed_tables <- summarise_observed_pairs(rpeak_observed$pairs)
+
+manifest[["03_rpeak_observed_pairs"]] <- save_table(rpeak_observed$pairs, "03_rpeak_observed_pairs", csv = FALSE)
+manifest[["03_rpeak_sesoi_reference"]] <- save_table(rpeak_observed$sesoi, "03_rpeak_sesoi_reference")
+manifest[["03_rpeak_observed_pooled"]] <- save_table(rpeak_observed_tables$pooled, "03_rpeak_observed_pooled")
+manifest[["03_rpeak_observed_by_participant"]] <- save_table(rpeak_observed_tables$by_participant, "03_rpeak_observed_by_participant")
+manifest[["03_rpeak_observed_by_components_removed"]] <- save_table(rpeak_observed_tables$by_components_removed, "03_rpeak_observed_by_components_removed")
+manifest[["03_rpeak_observed_by_channel"]] <- save_table(rpeak_observed_tables$by_channel, "03_rpeak_observed_by_channel")
+manifest[["03_rpeak_observed_class_counts"]] <- save_table(rpeak_observed_tables$class_counts, "03_rpeak_observed_class_counts")
+
+kable(rpeak_observed_tables$pooled, digits = 2)
+kable(rpeak_observed_tables$by_components_removed, digits = 2)
+```
+
+# Observed ICA–CCA comparison: alpha power preservation
+
+```{r observed-alpha}
+alpha_observed <- make_observed_method_pairs(
+  full15_alpha,
+  value_col = "alpha_power",
+  measure_name = "alpha_power",
+  lower_is_better = FALSE
+)
+
+alpha_observed_tables <- summarise_observed_pairs(alpha_observed$pairs)
+
+manifest[["04_alpha_observed_pairs"]] <- save_table(alpha_observed$pairs, "04_alpha_observed_pairs", csv = FALSE)
+manifest[["04_alpha_sesoi_reference"]] <- save_table(alpha_observed$sesoi, "04_alpha_sesoi_reference")
+manifest[["04_alpha_observed_pooled"]] <- save_table(alpha_observed_tables$pooled, "04_alpha_observed_pooled")
+manifest[["04_alpha_observed_by_participant"]] <- save_table(alpha_observed_tables$by_participant, "04_alpha_observed_by_participant")
+manifest[["04_alpha_observed_by_components_removed"]] <- save_table(alpha_observed_tables$by_components_removed, "04_alpha_observed_by_components_removed")
+manifest[["04_alpha_observed_by_channel"]] <- save_table(alpha_observed_tables$by_channel, "04_alpha_observed_by_channel")
+manifest[["04_alpha_observed_class_counts"]] <- save_table(alpha_observed_tables$class_counts, "04_alpha_observed_class_counts")
+
+kable(alpha_observed_tables$pooled, digits = 2)
+kable(alpha_observed_tables$by_components_removed, digits = 2)
+```
+
+# Optional model fitting
+
+The default is not to refit models. Set `params$refit_models = TRUE` only when the saved model files are missing or need to be regenerated.
+
+```{r optional-model-fitting, eval=params$refit_models, message=FALSE, warning=FALSE}
+fit_metric_model <- function(df, value_col, model_file) {
+  df_model <- df %>%
+    filter(is.finite(.data[[value_col]])) %>%
+    mutate(
+      participant = droplevels(factor(participant)),
+      method = factor(method, levels = c("ICA", "CCA")),
+      cleaning_level = factor(clean, levels = sort(unique(clean))),
+      channel = droplevels(factor(channel)),
+      participant_channel = interaction(participant, channel, drop = TRUE)
+    )
+  
+  fit <- brms::brm(
+    stats::as.formula(paste0(value_col, " ~ method * cleaning_level + (1 | participant) + (1 | channel) + (1 | participant_channel)")),
+    data = df_model,
+    family = brms::student(),
+    backend = "cmdstanr",
+    chains = 4,
+    iter = 4000,
+    warmup = 2000,
+    cores = 4,
+    seed = 123,
+    save_pars = brms::save_pars(all = TRUE),
+    control = list(adapt_delta = 0.95, max_treedepth = 12)
+  )
+  
+  saveRDS(fit, model_file)
+  fit
+}
+
+fit_rpeak <- fit_metric_model(full15_rpeak, "rpeak", settings$model_rpeak_file)
+fit_alpha <- fit_metric_model(full15_alpha, "alpha_power", settings$model_alpha_file)
+```
+
+# Model-based ICA–CCA summaries
+
+```{r model-helper-functions, message=FALSE, warning=FALSE}
+make_model_sesoi <- function(df, value_col) {
+  df %>%
+    filter(clean == settings$clean_baseline) %>%
+    group_by(dataset, participant, channel) %>%
+    summarise(baseline_value = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+    summarise(model_sesoi = settings$sesoi_prop * mean(abs(baseline_value), na.rm = TRUE)) %>%
+    pull(model_sesoi)
+}
+
+summarise_model_draws <- function(draws, model_sesoi, lower_is_better = TRUE, group_vars = NULL) {
+  group_vars <- rlang::syms(group_vars %||% character(0))
+  
+  draws %>%
+    group_by(!!!group_vars, contrast) %>%
+    summarise(
+      median = median(.value, na.rm = TRUE),
+      lower95 = safe_q(.value, 0.025),
+      upper95 = safe_q(.value, 0.975),
+      model_sesoi = model_sesoi,
+      p_CCA_lower_than_ICA = mean(.value < 0, na.rm = TRUE),
+      p_CCA_higher_than_ICA = mean(.value > 0, na.rm = TRUE),
+      p_CCA_better = if (lower_is_better) mean(.value < 0, na.rm = TRUE) else mean(.value > 0, na.rm = TRUE),
+      p_CCA_better_by_SESOI = if (lower_is_better) mean(.value < -model_sesoi, na.rm = TRUE) else mean(.value > model_sesoi, na.rm = TRUE),
+      p_ICA_better_by_SESOI = if (lower_is_better) mean(.value > model_sesoi, na.rm = TRUE) else mean(.value < -model_sesoi, na.rm = TRUE),
+      p_within_SESOI = mean(abs(.value) <= model_sesoi, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+summarise_model_method_estimates <- function(draws, group_vars = NULL) {
+  group_vars <- rlang::syms(group_vars %||% character(0))
+  
+  draws %>%
+    group_by(!!!group_vars, method) %>%
+    summarise(
+      median = median(.value, na.rm = TRUE),
+      lower95 = safe_q(.value, 0.025),
+      upper95 = safe_q(.value, 0.975),
+      .groups = "drop"
+    )
+}
+
+summarise_method_model <- function(model_file, metric_df, value_col, measure_name, lower_is_better = TRUE) {
+  if (!isTRUE(params$run_model_summaries)) return(NULL)
+  if (!file.exists(model_file)) return(NULL)
+  
+  fit <- readRDS(model_file)
+  model_sesoi <- make_model_sesoi(metric_df, value_col)
+  
+  emm_method <- emmeans::emmeans(fit, ~ method, epred = TRUE)
+  draws_method_estimates <- tidybayes::gather_emmeans_draws(emm_method)
+  method_estimates <- summarise_model_method_estimates(draws_method_estimates) %>%
+    mutate(measure = measure_name, posterior_scope = "overall_method_posterior") %>%
+    relocate(measure, posterior_scope)
+  
+  contr_method <- emmeans::contrast(emm_method, method = "revpairwise")
+  draws_method <- tidybayes::gather_emmeans_draws(contr_method)
+  overall <- summarise_model_draws(draws_method, model_sesoi, lower_is_better) %>%
+    mutate(measure = measure_name, contrast_scope = "overall") %>%
+    relocate(measure, contrast_scope)
+  
+  emm_clean <- emmeans::emmeans(fit, ~ method | cleaning_level, epred = TRUE)
+  contr_clean <- emmeans::contrast(emm_clean, method = "revpairwise")
+  draws_clean <- tidybayes::gather_emmeans_draws(contr_clean)
+  by_clean <- summarise_model_draws(draws_clean, model_sesoi, lower_is_better, group_vars = "cleaning_level") %>%
+    mutate(
+      measure = measure_name,
+      contrast_scope = "by_components_removed",
+      components_removed = as.integer(as.character(cleaning_level)) - 1L
+    ) %>%
+    select(-cleaning_level) %>%
+    relocate(measure, contrast_scope, components_removed) %>%
+    arrange(components_removed)
+  
+  # Keep posterior draws as RDS only for later diagnostics/figures.
+  draws_method_file <- file.path(outpath, paste0("draws_model_", measure_name, "_contrast_overall.rds"))
+  draws_method_estimates_file <- file.path(outpath, paste0("draws_model_", measure_name, "_method_posteriors_overall.rds"))
+  draws_clean_file  <- file.path(outpath, paste0("draws_model_", measure_name, "_method_by_clean.rds"))
+  saveRDS(draws_method, draws_method_file)
+  saveRDS(draws_method_estimates, draws_method_estimates_file)
+  saveRDS(draws_clean, draws_clean_file)
+  
+  list(
+    overall = overall,
+    method_estimates = method_estimates,
+    by_clean = by_clean,
+    model_sesoi = model_sesoi,
+    draws_method_file = draws_method_file,
+    draws_method_estimates_file = draws_method_estimates_file,
+    draws_clean_file = draws_clean_file
+  )
+}
+```
+
+```{r model-rpeak-alpha, message=FALSE, warning=FALSE}
+rpeak_model <- summarise_method_model(
+  model_file = settings$model_rpeak_file,
+  metric_df = full15_rpeak,
+  value_col = "rpeak",
+  measure_name = "rpeak",
+  lower_is_better = TRUE
+)
+
+alpha_model <- summarise_method_model(
+  model_file = settings$model_alpha_file,
+  metric_df = full15_alpha,
+  value_col = "alpha_power",
+  measure_name = "alpha_power",
+  lower_is_better = FALSE
+)
+
+if (!is.null(rpeak_model)) {
+  manifest[["05_model_rpeak_method_overall"]] <- save_table(
+    rpeak_model$overall,
+    "05_model_rpeak_method_overall"
+  )
+  manifest[["05_model_rpeak_method_estimates"]] <- save_table(
+    rpeak_model$method_estimates,
+    "05_model_rpeak_method_estimates"
+  )
+  manifest[["05_model_rpeak_method_by_clean"]] <- save_table(
+    rpeak_model$by_clean,
+    "05_model_rpeak_method_by_clean"
+  )
+} else {
+  message("Skipping R-peak model summaries: model file unavailable.")
+}
+
+if (!is.null(alpha_model)) {
+  manifest[["06_model_alpha_method_overall"]] <- save_table(
+    alpha_model$overall,
+    "06_model_alpha_method_overall"
+  )
+  manifest[["06_model_alpha_method_estimates"]] <- save_table(
+    alpha_model$method_estimates,
+    "06_model_alpha_method_estimates"
+  )
+  manifest[["06_model_alpha_method_by_clean"]] <- save_table(
+    alpha_model$by_clean,
+    "06_model_alpha_method_by_clean"
+  )
+  
+  alpha_model_sesoi_check <- alpha_model$overall %>%
+    transmute(
+      measure,
+      median,
+      lower95,
+      upper95,
+      model_sesoi,
+      median_over_sesoi = median / model_sesoi,
+      p_CCA_higher_than_ICA,
+      p_CCA_better_by_SESOI,
+      p_within_SESOI
+    )
+  
+  manifest[["06_model_alpha_sesoi_check"]] <- save_table(
+    alpha_model_sesoi_check,
+    "06_model_alpha_sesoi_check"
+  )
+} else {
+  alpha_model_sesoi_check <- NULL
+  message("Skipping alpha model summaries: model file unavailable.")
+}
+
+check_model_component_levels <- function(
+    model_object,
+    measure_name,
+    expected_components = 0:15
+) {
+  if (is.null(model_object)) {
+    return(tibble(
+      measure = measure_name,
+      n_component_levels_returned = NA_integer_,
+      expected_n_component_levels = length(expected_components),
+      components_returned = NA_character_,
+      status = "model summary not generated"
+    ))
+  }
+  returned <- sort(unique(model_object$by_clean$components_removed))
+  tibble(
+    measure = measure_name,
+    n_component_levels_returned = length(returned),
+    expected_n_component_levels = length(expected_components),
+    components_returned = paste(returned, collapse = ","),
+    status = if_else(
+      setequal(returned, expected_components),
+      "ok: all 0-15 component levels returned",
+      "check saved model: by-clean emmeans did not return all 0-15 levels"
+    )
+  )
+}
+
+model_component_level_check <- bind_rows(
+  check_model_component_levels(rpeak_model, "rpeak"),
+  check_model_component_levels(alpha_model, "alpha_power")
+)
+
+manifest[["07_model_component_level_check"]] <- save_table(
+  model_component_level_check,
+  "07_model_component_level_check"
+)
+
+if (any(
+  model_component_level_check$n_component_levels_returned <
+    model_component_level_check$expected_n_component_levels,
+  na.rm = TRUE
+)) {
+  warning(
+    "At least one saved model did not return all component levels. ",
+    "This usually means the model was fitted with cleaning_level as numeric, ",
+    "or the wrong saved model file was read. Refit with cleaning_level as a factor."
+  )
+}
+```
+
+## R-peak model tables
+
+Overall CCA − ICA contrast.
+
+```{r model-rpeak-overall-table}
+if (!is.null(rpeak_model)) {
+  kable(rpeak_model$overall, digits = 3)
+} else {
+  message("R-peak model summary was not generated.")
+}
+```
+
+Posterior method estimates.
+
+```{r model-rpeak-method-estimates-table}
+if (!is.null(rpeak_model)) {
+  kable(rpeak_model$method_estimates, digits = 3)
+} else {
+  message("R-peak model summary was not generated.")
+}
+```
+
+CCA − ICA contrast by components removed.
+
+```{r model-rpeak-by-components-table}
+if (!is.null(rpeak_model)) {
+  kable(rpeak_model$by_clean, digits = 3)
+} else {
+  message("R-peak model summary was not generated.")
+}
+```
+
+## Alpha model tables
+
+Overall CCA − ICA contrast.
+
+```{r model-alpha-overall-table}
+if (!is.null(alpha_model)) {
+  kable(alpha_model$overall, digits = 3)
+} else {
+  message("Alpha model summary was not generated.")
+}
+```
+
+Posterior method estimates.
+
+```{r model-alpha-method-estimates-table}
+if (!is.null(alpha_model)) {
+  kable(alpha_model$method_estimates, digits = 3)
+} else {
+  message("Alpha model summary was not generated.")
+}
+```
+
+CCA − ICA contrast by components removed.
+
+```{r model-alpha-by-components-table}
+if (!is.null(alpha_model)) {
+  kable(alpha_model$by_clean, digits = 3)
+} else {
+  message("Alpha model summary was not generated.")
+}
+```
+
+Alpha SESOI diagnostic for the overall contrast.
+
+```{r model-alpha-sesoi-check-table}
+if (!is.null(alpha_model_sesoi_check)) {
+  kable(alpha_model_sesoi_check, digits = 3)
+} else {
+  message("Alpha model SESOI diagnostic was not generated.")
+}
+```
+
+Model component-level check.
+
+```{r model-component-level-check-table}
+kable(model_component_level_check)
+```
+
+
+# Figures
+
+```{r figure-helper-functions}
+make_trajectory_plot <- function(df, value_col, ylab, title, subtitle = NULL) {
+  plot_data <- df %>%
+    filter(is.finite(.data[[value_col]])) %>%
+    group_by(dataset, participant, method, components_removed) %>%
+    summarise(value_participant = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+    group_by(method, components_removed) %>%
+    summarise(
+      n_participants = n_distinct(participant),
+      mean = mean(value_participant, na.rm = TRUE),
+      se = sd(value_participant, na.rm = TRUE) / sqrt(n()),
+      median = median(value_participant, na.rm = TRUE),
+      q25 = safe_q(value_participant, 0.25),
+      q75 = safe_q(value_participant, 0.75),
+      .groups = "drop"
+    )
+  
+  ggplot(plot_data, aes(x = components_removed, y = mean, colour = method, fill = method)) +
+    geom_ribbon(aes(ymin = mean - se, ymax = mean + se), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 0.85) +
+    geom_point(size = 1.8) +
+    scale_colour_manual(values = method_cols) +
+    scale_fill_manual(values = method_cols) +
+    scale_x_continuous(breaks = 0:15, limits = c(0, 15)) +
+    labs(
+      x = "Components removed",
+      y = ylab,
+      colour = "Method",
+      fill = "Method",
+      title = title,
+      subtitle = subtitle
+    ) +
+    theme_pub
+}
+
+make_observed_class_plot <- function(pairs, title, subtitle = NULL) {
+  plot_data <- pairs %>%
+    count(components_removed, method_sesoi_class, name = "n") %>%
+    group_by(components_removed) %>%
+    mutate(percent = 100 * n / sum(n)) %>%
+    ungroup()
+  
+  ggplot(plot_data, aes(x = factor(components_removed), y = percent, fill = method_sesoi_class)) +
+    geom_col(width = 0.8, colour = "white", linewidth = 0.2) +
+    scale_fill_manual(values = class_cols, drop = FALSE) +
+    labs(
+      x = "Components removed",
+      y = "% paired observations",
+      fill = "Observed class",
+      title = title,
+      subtitle = subtitle
+    ) +
+    theme_pub
+}
+
+make_model_contrast_plot <- function(model_by_clean, ylab, title, subtitle = NULL) {
+  if (is.null(model_by_clean)) return(NULL)
+  sesoi <- unique(model_by_clean$model_sesoi)
+  sesoi <- sesoi[is.finite(sesoi)][1]
+  
+  ggplot(model_by_clean, aes(x = components_removed, y = median)) +
+    geom_hline(yintercept = 0, linewidth = 0.35, colour = cca_pal$zero) +
+    geom_hline(yintercept = c(-sesoi, sesoi), linewidth = 0.30, linetype = "dashed", colour = cca_pal$mid_grey) +
+    geom_line(colour = cca_pal$method[["CCA"]], linewidth = 0.55) +
+    geom_pointrange(aes(ymin = lower95, ymax = upper95), colour = cca_pal$method[["CCA"]], linewidth = 0.55) +
+    scale_x_continuous(breaks = 0:15, limits = c(0, 15)) +
+    labs(
+      x = "Components removed",
+      y = ylab,
+      title = title,
+      subtitle = subtitle
+    ) +
+    theme_pub
+}
+
+make_model_contrast_density_plot <- function(model_object, xlab, title, subtitle = NULL) {
+  if (is.null(model_object)) return(NULL)
+  if (!file.exists(model_object$draws_method_file)) return(NULL)
+  draws <- readRDS(model_object$draws_method_file)
+  sesoi <- model_object$model_sesoi
+  summary_row <- model_object$overall %>% slice(1)
+  
+  ggplot(draws, aes(x = .value)) +
+    geom_density(fill = cca_pal$light_grey, colour = cca_pal$dark_grey, alpha = 0.65, linewidth = 0.8) +
+    geom_vline(xintercept = 0, colour = cca_pal$zero, linewidth = 0.45) +
+    geom_vline(xintercept = c(-sesoi, sesoi), colour = cca_pal$mid_grey, linewidth = 0.35, linetype = "dashed") +
+    geom_vline(xintercept = summary_row$median, colour = cca_pal$method[["CCA"]], linewidth = 0.8) +
+    labs(
+      x = xlab,
+      y = "Posterior density",
+      title = title,
+      subtitle = subtitle
+    ) +
+    theme_pub
+}
+
+make_model_method_posterior_plot <- function(model_object, xlab, title, subtitle = NULL) {
+  if (is.null(model_object)) return(NULL)
+  if (!file.exists(model_object$draws_method_estimates_file)) return(NULL)
+  draws <- readRDS(model_object$draws_method_estimates_file) %>%
+    mutate(method = factor(method, levels = c("ICA", "CCA")))
+  estimates <- model_object$method_estimates %>%
+    mutate(method = factor(method, levels = c("ICA", "CCA")))
+  
+  ggplot(draws, aes(x = .value, fill = method, colour = method)) +
+    geom_density(alpha = 0.28, linewidth = 0.8) +
+    geom_vline(
+      data = estimates,
+      aes(xintercept = median, colour = method),
+      linewidth = 0.8,
+      show.legend = FALSE
+    ) +
+    geom_segment(
+      data = estimates,
+      aes(x = lower95, xend = upper95, y = -Inf, yend = -Inf, colour = method),
+      inherit.aes = FALSE,
+      linewidth = 2.2,
+      show.legend = FALSE
+    ) +
+    scale_fill_manual(values = method_cols) +
+    scale_colour_manual(values = method_cols) +
+    labs(
+      x = xlab,
+      y = "Posterior density",
+      fill = "Method",
+      colour = "Method",
+      title = title,
+      subtitle = subtitle
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_pub
+}
+```
+
+```{r figures-rpeak-alpha, fig.width=7, fig.height=4.5}
+p_rpeak_trajectory <- make_trajectory_plot(
+  full15_rpeak,
+  value_col = "rpeak",
+  ylab = "R-peak prominence",
+  title = "R-peak prominence after ICA and CCA cleaning",
+  subtitle = "Participant-balanced mean across EEG channels; ribbon = ±1 SE across participants"
+)
+p_rpeak_trajectory
+save_plot_both(p_rpeak_trajectory, "fig_part1_rpeak_trajectory")
+
+p_alpha_trajectory <- make_trajectory_plot(
+  full15_alpha,
+  value_col = "alpha_power_db",
+  ylab = "Alpha power (dB)",
+  title = "Alpha power after ICA and CCA cleaning",
+  subtitle = "Alpha power converted from linear PSD units using 10 × log10; ribbon = ±1 SE across participants"
+)
+p_alpha_trajectory
+save_plot_both(p_alpha_trajectory, "fig_part1_alpha_trajectory")
+
+p_rpeak_class <- make_observed_class_plot(
+  rpeak_observed$pairs,
+  title = "Observed ICA–CCA R-peak comparison by components removed",
+  subtitle = "CCA better means lower R-peak prominence by more than participant × channel SESOI"
+)
+p_rpeak_class
+save_plot_both(p_rpeak_class, "fig_part1_rpeak_observed_classes")
+
+p_alpha_class <- make_observed_class_plot(
+  alpha_observed$pairs,
+  title = "Observed ICA–CCA alpha comparison by components removed",
+  subtitle = "CCA better means higher alpha power by more than participant × channel SESOI"
+)
+p_alpha_class
+save_plot_both(p_alpha_class, "fig_part1_alpha_observed_classes")
+```
+
+```{r figures-model-contrasts, fig.width=7, fig.height=4.5}
+if (!is.null(rpeak_model)) {
+  p_rpeak_model_contrast <- make_model_contrast_plot(
+    rpeak_model$by_clean,
+    ylab = "CCA - ICA posterior predicted R-peak prominence",
+    title = "Model-based R-peak method contrast by components removed",
+    subtitle = "Negative values favour CCA; dashed lines show ± model SESOI"
+  )
+  print(p_rpeak_model_contrast)
+  save_plot_both(p_rpeak_model_contrast, "fig_part1_rpeak_model_contrast")
+}
+
+if (!is.null(alpha_model)) {
+  p_alpha_model_contrast <- make_model_contrast_plot(
+    alpha_model$by_clean,
+    ylab = "CCA - ICA posterior predicted alpha power",
+    title = "Model-based alpha method contrast by components removed",
+    subtitle = "Positive values favour CCA; dashed lines show ± model SESOI"
+  )
+  print(p_alpha_model_contrast)
+  save_plot_both(p_alpha_model_contrast, "fig_part1_alpha_model_contrast")
+}
+```
+
+```{r figures-model-posterior-densities, fig.width=7, fig.height=4.5}
+if (!is.null(rpeak_model)) {
+  p_rpeak_contrast_density <- make_model_contrast_density_plot(
+    rpeak_model,
+    xlab = "Posterior CCA - ICA R-peak prominence",
+    title = "Posterior method contrast for R-peak prominence",
+    subtitle = "Negative values favour CCA; dashed lines show ± model SESOI"
+  )
+  print(p_rpeak_contrast_density)
+  save_plot_both(p_rpeak_contrast_density, "fig_part1_rpeak_contrast_posterior_density")
+  
+  p_rpeak_method_posteriors <- make_model_method_posterior_plot(
+    rpeak_model,
+    xlab = "Posterior predicted R-peak prominence",
+    title = "Overall posterior R-peak prominence by method",
+    subtitle = "Marginal posterior predictions averaged over components removed"
+  )
+  print(p_rpeak_method_posteriors)
+  save_plot_both(p_rpeak_method_posteriors, "fig_part1_rpeak_method_posteriors_overall")
+}
+
+if (!is.null(alpha_model)) {
+  p_alpha_contrast_density <- make_model_contrast_density_plot(
+    alpha_model,
+    xlab = "Posterior CCA - ICA alpha power",
+    title = "Posterior method contrast for alpha power",
+    subtitle = "Positive values favour CCA; dashed lines show ± model SESOI"
+  )
+  print(p_alpha_contrast_density)
+  save_plot_both(p_alpha_contrast_density, "fig_part1_alpha_contrast_posterior_density")
+  
+  p_alpha_method_posteriors <- make_model_method_posterior_plot(
+    alpha_model,
+    xlab = "Posterior predicted alpha power",
+    title = "Overall posterior alpha power by method",
+    subtitle = "Marginal posterior predictions averaged over components removed"
+  )
+  print(p_alpha_method_posteriors)
+  save_plot_both(p_alpha_method_posteriors, "fig_part1_alpha_method_posteriors_overall")
+}
+```
+
+# Compact text-ready tables
+
+```{r compact-text-ready-tables}
+compact_method_summary <- bind_rows(
+  rpeak_observed_tables$pooled %>%
+    transmute(
+      measure,
+      source = "observed",
+      direction,
+      n = n_paired_observations,
+      pct_CCA_better,
+      pct_CCA_better_by_SESOI,
+      pct_similar_within_SESOI,
+      pct_ICA_better_by_SESOI,
+      median_diff_CCA_minus_ICA,
+      lower95 = NA_real_,
+      upper95 = NA_real_,
+      p_CCA_better = NA_real_,
+      p_CCA_better_by_SESOI = NA_real_,
+      p_within_SESOI = NA_real_
+    ),
+  alpha_observed_tables$pooled %>%
+    transmute(
+      measure,
+      source = "observed",
+      direction,
+      n = n_paired_observations,
+      pct_CCA_better,
+      pct_CCA_better_by_SESOI,
+      pct_similar_within_SESOI,
+      pct_ICA_better_by_SESOI,
+      median_diff_CCA_minus_ICA,
+      lower95 = NA_real_,
+      upper95 = NA_real_,
+      p_CCA_better = NA_real_,
+      p_CCA_better_by_SESOI = NA_real_,
+      p_within_SESOI = NA_real_
+    ),
+  if (!is.null(rpeak_model)) {
+    rpeak_model$overall %>%
+      transmute(
+        measure,
+        source = "model",
+        direction = "lower is better",
+        n = NA_integer_,
+        pct_CCA_better = NA_real_,
+        pct_CCA_better_by_SESOI = NA_real_,
+        pct_similar_within_SESOI = NA_real_,
+        pct_ICA_better_by_SESOI = NA_real_,
+        median_diff_CCA_minus_ICA = median,
+        lower95,
+        upper95,
+        p_CCA_better,
+        p_CCA_better_by_SESOI,
+        p_within_SESOI
+      )
+  },
+  if (!is.null(alpha_model)) {
+    alpha_model$overall %>%
+      transmute(
+        measure,
+        source = "model",
+        direction = "higher is better",
+        n = NA_integer_,
+        pct_CCA_better = NA_real_,
+        pct_CCA_better_by_SESOI = NA_real_,
+        pct_similar_within_SESOI = NA_real_,
+        pct_ICA_better_by_SESOI = NA_real_,
+        median_diff_CCA_minus_ICA = median,
+        lower95,
+        upper95,
+        p_CCA_better,
+        p_CCA_better_by_SESOI,
+        p_within_SESOI
+      )
+  }
+)
+
+manifest[["07_compact_method_summary"]] <- save_table(compact_method_summary, "07_compact_method_summary")
+kable(compact_method_summary, digits = 3)
+```
+
+# Main result sentence stubs
+
+```{r sentence-stubs}
+get_row1 <- function(x) {
+  if (is.null(x) || nrow(x) == 0) return(NULL)
+  x %>% slice(1)
+}
+
+make_observed_sentence <- function(row, metric_label, better_word) {
+  if (is.null(row)) {
+    return(paste0("Observed ", metric_label, " method counts were not generated."))
+  }
+  sprintf(
+    "Across %s paired full 15-channel observations excluding the no-cleaning baseline, CCA showed %s than ICA in %s of observations and by more than the participant × EEG-channel SESOI in %s of observations; %s were practically similar and ICA was better by more than SESOI in %s. The median CCA minus ICA difference was %s.",
+    format(row$n_paired_observations, big.mark = ","),
+    better_word,
+    fmt_pct(row$pct_CCA_better, 1),
+    fmt_pct(row$pct_CCA_better_by_SESOI, 1),
+    fmt_pct(row$pct_similar_within_SESOI, 1),
+    fmt_pct(row$pct_ICA_better_by_SESOI, 1),
+    fmt_num(row$median_diff_CCA_minus_ICA, 3)
+  )
+}
+
+make_rpeak_model_sentence <- function(model) {
+  if (is.null(model)) {
+    return("The all-channel Bayesian model summary for R-peak prominence was not generated because the saved model file was unavailable.")
+  }
+  row <- model$overall %>% slice(1)
+  sprintf(
+    "In the all-channel Bayesian model, the posterior CCA minus ICA contrast for R-peak prominence was %s [central 95%% interval %s, %s], with P(CCA < ICA) = %s and P((CCA - ICA) < -SESOI) = %s.",
+    fmt_num(row$median, 3),
+    fmt_num(row$lower95, 3),
+    fmt_num(row$upper95, 3),
+    fmt_num(row$p_CCA_lower_than_ICA, 3),
+    fmt_num(row$p_CCA_better_by_SESOI, 3)
+  )
+}
+
+make_alpha_model_sentence <- function(model) {
+  if (is.null(model)) {
+    return("The all-channel Bayesian model summary for alpha power was not generated because the saved model file was unavailable.")
+  }
+  row <- model$overall %>% slice(1)
+  sprintf(
+    "In the all-channel Bayesian model, the posterior CCA minus ICA contrast for alpha power was %s [central 95%% interval %s, %s], with P(CCA > ICA) = %s, P(|CCA - ICA| <= SESOI) = %s, and P(CCA higher by more than SESOI) = %s.",
+    fmt_num(row$median, 3),
+    fmt_num(row$lower95, 3),
+    fmt_num(row$upper95, 3),
+    fmt_num(row$p_CCA_higher_than_ICA, 3),
+    fmt_num(row$p_within_SESOI, 3),
+    fmt_num(row$p_CCA_better_by_SESOI, 3)
+  )
+}
+
+sentence_stubs <- tibble(
+  result_part = c(
+    "R-peak observed",
+    "R-peak model",
+    "Alpha observed",
+    "Alpha model"
+  ),
+  sentence_text = c(
+    make_observed_sentence(
+      get_row1(rpeak_observed_tables$pooled),
+      metric_label = "R-peak prominence",
+      better_word = "lower R-peak prominence"
+    ),
+    make_rpeak_model_sentence(rpeak_model),
+    make_observed_sentence(
+      get_row1(alpha_observed_tables$pooled),
+      metric_label = "alpha power",
+      better_word = "higher alpha power"
+    ),
+    make_alpha_model_sentence(alpha_model)
+  )
+)
+
+alpha_paragraph_numbers <- bind_rows(
+  alpha_observed_tables$pooled %>%
+    transmute(
+      source = "observed",
+      n_paired_observations,
+      pct_CCA_lower_alpha_by_SESOI = pct_ICA_better_by_SESOI,
+      pct_similar_within_SESOI,
+      pct_CCA_higher_alpha_by_SESOI = pct_CCA_better_by_SESOI,
+      median_diff_CCA_minus_ICA,
+      lower95 = NA_real_,
+      upper95 = NA_real_,
+      p_CCA_higher_than_ICA = NA_real_,
+      p_within_SESOI = NA_real_,
+      p_CCA_higher_by_SESOI = NA_real_
+    ),
+  if (!is.null(alpha_model)) {
+    alpha_model$overall %>%
+      transmute(
+        source = "model",
+        n_paired_observations = NA_integer_,
+        pct_CCA_lower_alpha_by_SESOI = NA_real_,
+        pct_similar_within_SESOI = NA_real_,
+        pct_CCA_higher_alpha_by_SESOI = NA_real_,
+        median_diff_CCA_minus_ICA = median,
+        lower95,
+        upper95,
+        p_CCA_higher_than_ICA,
+        p_within_SESOI,
+        p_CCA_higher_by_SESOI = p_CCA_better_by_SESOI
+      )
+  }
+)
+
+manifest[["08_sentence_stubs_part1"]] <- save_table(sentence_stubs, "08_sentence_stubs_part1")
+manifest[["09_alpha_paragraph_numbers"]] <- save_table(alpha_paragraph_numbers, "09_alpha_paragraph_numbers")
+```
+
+Sentence stubs for Part 1.
+
+```{r sentence-stubs-table}
+kable(sentence_stubs)
+```
+
+Numbers for the alpha paragraph.
+
+```{r alpha-paragraph-numbers-table}
+kable(alpha_paragraph_numbers, digits = 3)
+```
+
+# Manifest
+
+```{r manifest, echo=FALSE, message=FALSE}
+manifest_df <- bind_rows(manifest)
+manifest_public <- manifest_df %>%
+  mutate(
+    rds = if_else(is.na(rds), NA_character_, basename(rds)),
+    csv = if_else(is.na(csv), NA_character_, basename(csv))
+  )
+manifest[["99_manifest"]] <- save_table(manifest_public, "99_manifest")
+
+cat("Manifest saved as 99_manifest.rds and 99_manifest.csv.\n")
+
+if (isTRUE(params$show_manifest)) {
+  kable(manifest_public)
+}
+```

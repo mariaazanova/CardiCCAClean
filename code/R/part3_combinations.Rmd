@@ -1,0 +1,2068 @@
+---
+title: "Part 3 — Reduced ECG-channel combinations: exact candidates, robustness, recurrence, and anatomy"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  sesoi_prop: 0.05
+  recompute_scored_data: false
+  top_prop_main: 0.20
+  top_exact_n_for_plots: 10
+  top_subset_n_for_plots: 10
+  n_boot: 100
+  bootstrap_seed: 20260708
+  run_bootstrap: true
+  save_figures: true
+  show_manifest: false
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(rstudioapi)
+  library(R.matlab)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(purrr)
+  library(stringr)
+  library(ggplot2)
+  library(scales)
+  library(knitr)
+})
+
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+codepath <- dirname(rstudioapi::getSourceEditorContext()$path)
+project_root <- dirname(dirname(codepath))
+datapath <- file.path(project_root, "data")
+vispath <- file.path(project_root, "vis")
+modelpath <- file.path(datapath, "models")
+
+outpath <- file.path(datapath, "results_markdown", "part3_combinations")
+figpath <- file.path(vispath, "results", "part3_combinations")
+dir.create(outpath, recursive = TRUE, showWarnings = FALSE)
+dir.create(figpath, recursive = TRUE, showWarnings = FALSE)
+
+source(file.path(codepath, "data_loading_functions.R"))
+source(file.path(codepath, "ecg_annotations.R"))
+
+settings <- list(
+  methods_keep = "CCA",
+  sesoi_prop = params$sesoi_prop,
+  top_prop_main = params$top_prop_main,
+  top_exact_n_for_plots = params$top_exact_n_for_plots,
+  top_subset_n_for_plots = params$top_subset_n_for_plots,
+  n_boot = params$n_boot,
+  bootstrap_seed = params$bootstrap_seed,
+  run_bootstrap = params$run_bootstrap,
+  scored_file = file.path(datapath, "cca_comb_vs_full15_data1_data2.rds")
+)
+
+safe_q <- function(x, p) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  unname(stats::quantile(x, probs = p, na.rm = TRUE))
+}
+
+safe_mean <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  mean(x)
+}
+
+safe_median <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  median(x)
+}
+
+fmt_num <- function(x, digits = 2) {
+  ifelse(is.na(x), "NA", formatC(x, format = "f", digits = digits))
+}
+
+fmt_pct <- function(x, digits = 1) {
+  ifelse(is.na(x), "NA", paste0(formatC(x, format = "f", digits = digits), "%"))
+}
+
+public_table_names <- function(x) {
+  if (!is.data.frame(x)) return(x)
+  nm <- names(x)
+  nm <- stringr::str_replace_all(nm, "parent_n_ecg_leads", "parent_n_ecg_channels")
+  nm <- stringr::str_replace_all(nm, "n_ecg_leads", "n_ecg_channels")
+  nm <- stringr::str_replace_all(nm, "ecg_leads", "ecg_channels")
+  names(x) <- nm
+  x
+}
+
+save_table <- function(x, name, csv = TRUE) {
+  rds_file <- file.path(outpath, paste0(name, ".rds"))
+  saveRDS(x, rds_file)
+  csv_file <- NA_character_
+  if (csv) {
+    csv_file <- file.path(outpath, paste0(name, ".csv"))
+    utils::write.csv(public_table_names(x), csv_file, row.names = FALSE)
+  }
+  tibble(
+    name = name,
+    rds = rds_file,
+    csv = csv_file,
+    n_rows = ifelse(is.data.frame(x), nrow(x), NA_integer_)
+  )
+}
+
+kable_clean <- function(x, digits = 2, ...) {
+  knitr::kable(public_table_names(x), digits = digits, ...)
+}
+
+save_plot_both <- function(plot, name, width = 8, height = 5) {
+  if (!isTRUE(params$save_figures)) return(invisible(NULL))
+  ggsave(file.path(figpath, paste0(name, ".pdf")), plot, width = width, height = height, device = cairo_pdf)
+  ggsave(file.path(figpath, paste0(name, ".png")), plot, width = width, height = height, dpi = 300)
+}
+
+n_top_prop <- function(n_available, prop = settings$top_prop_main) {
+  max(1L, ceiling(prop * n_available))
+}
+
+make_combo_uid <- function(n_ecg_leads, combination_id, ecg_leads) {
+  paste(n_ecg_leads, combination_id, ecg_leads, sep = "__")
+}
+
+fig_font_family <- "Times New Roman"
+
+cca_pal <- list(
+  method = c(
+    "ICA" = "#1D4E89",
+    "CCA" = "#8A1538"
+  ),
+  highlight = "#39B54A",
+  zero = "#555555",
+  text = "#2B2B2B",
+  grid = "#E8E4DC",
+  strip = "#F3EFE7",
+  light_grey = "#D8D8D8",
+  mid_grey = "#8A8A8A",
+  dark_grey = "#3A3A3A",
+  heat = c(
+    "#EFEFEF",
+    "#F6D96B",
+    "#E07A3F",
+    "#B2182B"
+  )
+)
+
+highlight_cols <- list(
+  zero_line = cca_pal$zero,
+  dark_grey = cca_pal$dark_grey,
+  light_grey = cca_pal$light_grey,
+  grid = cca_pal$grid,
+  strip = cca_pal$strip,
+  accent = cca_pal$method[["CCA"]]
+)
+
+scale_fill_cca_heat <- function(..., limits = NULL, labels = waiver(), breaks = waiver()) {
+  scale_fill_gradientn(
+    colours = cca_pal$heat,
+    limits = limits,
+    labels = labels,
+    breaks = breaks,
+    oob = scales::squish,
+    ...
+  )
+}
+
+scale_colour_cca_heat <- function(..., limits = NULL, labels = waiver(), breaks = waiver()) {
+  scale_colour_gradientn(
+    colours = cca_pal$heat,
+    limits = limits,
+    labels = labels,
+    breaks = breaks,
+    oob = scales::squish,
+    ...
+  )
+}
+
+validation_cols <- c(
+  "Participant-specific top 20%" = cca_pal$mid_grey,
+  "EEG-channel-specific top 20%" = cca_pal$heat[2]
+)
+
+bootstrap_cols <- c(
+  "participant" = cca_pal$mid_grey,
+  "channel" = cca_pal$heat[3],
+  "Participant resampling" = cca_pal$mid_grey,
+  "EEG-channel resampling" = cca_pal$heat[3]
+)
+
+status_cols <- c(
+  "FALSE" = cca_pal$mid_grey,
+  "TRUE" = cca_pal$heat[3]
+)
+
+
+family_levels <- c(
+  "all V/precordial",
+  "all neck/supraclavicular",
+  "all limb anchors",
+  "V + limb",
+  "V + neck/supraclavicular",
+  "neck/supraclavicular + limb",
+  "V + neck/supraclavicular + limb"
+)
+
+assign_anatomical_family_exclusive <- function(
+    n_total,
+    n_V,
+    n_upper_vascular,
+    n_standard_limb,
+    contains_V,
+    contains_upper_vascular,
+    contains_standard_limb
+) {
+  n_classified <- n_V + n_upper_vascular + n_standard_limb
+  family_key <- paste0(
+    ifelse(contains_V, "V", ""),
+    ifelse(contains_upper_vascular, "U", ""),
+    ifelse(contains_standard_limb, "L", "")
+  )
+  
+  case_when(
+    is.na(n_total) | n_total == 0 ~ NA_character_,
+    n_classified != n_total ~ NA_character_,
+    family_key == "V" ~ "all V/precordial",
+    family_key == "U" ~ "all neck/supraclavicular",
+    family_key == "L" ~ "all limb anchors",
+    family_key == "VL" ~ "V + limb",
+    family_key == "VU" ~ "V + neck/supraclavicular",
+    family_key == "UL" ~ "neck/supraclavicular + limb",
+    family_key == "VUL" ~ "V + neck/supraclavicular + limb",
+    TRUE ~ NA_character_
+  )
+}
+
+theme_pub <- theme_bw(base_size = 12, base_family = fig_font_family) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(size = 9.5),
+    legend.text = element_text(size = 9),
+    strip.background = element_rect(fill = cca_pal$strip, colour = NA),
+    strip.text = element_text(face = "bold", colour = cca_pal$text),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.25, colour = cca_pal$grid),
+    axis.title = element_text(size = 10.5, colour = cca_pal$text),
+    axis.text = element_text(size = 9.5, colour = cca_pal$text),
+    plot.title = element_text(face = "bold", size = 12, colour = cca_pal$text),
+    plot.subtitle = element_text(size = 9.5, colour = cca_pal$text),
+    plot.margin = margin(7, 7, 7, 7)
+  )
+
+theme_pub_small <- theme_pub +
+  theme(
+    plot.title = element_text(face = "bold", size = 10.5),
+    plot.subtitle = element_text(size = 8.8),
+    axis.title = element_text(size = 9.5),
+    axis.text = element_text(size = 8.3),
+    legend.title = element_text(size = 8.5),
+    legend.text = element_text(size = 7.8)
+  )
+
+manifest <- list()
+```
+
+# Analysis logic
+
+Part 3 treats reduced ECG-channel montage selection as a **non-inferiority problem** relative to the best full 15-channel CCA result.
+
+For each participant × EEG channel:
+
+1. The full 15-channel reference is the minimum residual R-peak prominence across full-montage CCA cleaning levels.
+2. Each reduced 1-, 2-, 3-, 4-, and 5-channel ECG combination is evaluated at its own best cleaning level.
+3. The loss relative to full 15 is
+   \[
+   \Delta_{\mathrm{full15}} = Rpeak_{reduced,best} - Rpeak_{full15,best}.
+   \]
+4. A reduced combination is classified as **not meaningfully worse than full 15** when
+   \[
+   \Delta_{\mathrm{full15}} \leq SESOI,
+   \]
+   where SESOI is `r params$sesoi_prop * 100`% of the no-cleaning R-peak value for that participant × EEG channel.
+
+Important implementation choices in this file:
+
+- Main exact-combination rankings are participant-balanced: first compute `% EEG channels as good as full 15` within each participant, then summarize across participants.
+- Main bar plots show only `r params$top_exact_n_for_plots` exact combinations per ECG-channel count, but all recurrence and stability summaries use the top `r params$top_prop_main * 100`% pool.
+- Therefore, the actual number of top combinations depends on ECG-channel count: `ceiling(top_prop * choose(15, n_channels))`.
+- Anatomical families are applied only after exact combinations are ranked.
+
+# Load or recompute reduced-combination scores
+
+```{r load-or-recompute-scored-data, message=FALSE, warning=FALSE}
+recompute_combination_scores <- function() {
+  methods_keep <- settings$methods_keep
+  sesoi_prop <- settings$sesoi_prop
+  
+  chlabels_data1 <- load_chlabels_dataset("sub_chlabels.mat")
+  chlabels_data2 <- load_chlabels_dataset("sub_chlabels_data2.mat")
+  
+  n_data1 <- length(chlabels_data1)
+  n_data2 <- length(chlabels_data2)
+  participant_levels <- sprintf("P%02d", seq_len(n_data1 + n_data2))
+  
+  file_plan_data1 <- tribble(
+    ~n_ecg_leads, ~file,
+    1L, "combinationsdata_1_2_3.mat",
+    2L, "combinationsdata_1_2_3.mat",
+    3L, "combinationsdata_1_2_3.mat",
+    4L, "combinationsdata_4.mat",
+    5L, "combinationsdata_5.mat"
+  )
+  
+  file_plan_data2 <- tibble(
+    n_ecg_leads = 1:5,
+    file = sprintf("combinationsdata2_%d.mat", n_ecg_leads)
+  )
+  
+  df_full15_data1 <- load_full15_rpeak_dataset(
+    data_file = "data4stats.mat",
+    chlabels_by_group = chlabels_data1,
+    dataset = "data1",
+    offset = 0,
+    methods = methods_keep,
+    measure = "rpeak",
+    value_name = "rpeak"
+  )
+  
+  df_full15_data2 <- load_full15_rpeak_dataset(
+    data_file = "data4stats_2.mat",
+    chlabels_by_group = chlabels_data2,
+    dataset = "data2",
+    offset = n_data1,
+    methods = methods_keep,
+    measure = "rpeak",
+    value_name = "rpeak"
+  )
+  
+  df_full15 <- bind_rows(df_full15_data1, df_full15_data2) %>%
+    mutate(
+      participant = factor(participant, levels = participant_levels),
+      subID = factor(subID, levels = participant_levels)
+    )
+  
+  rm(df_full15_data1, df_full15_data2)
+  gc()
+  
+  df_comb_data1 <- load_comb_dataset(
+    file_plan = file_plan_data1,
+    chlabels_by_group = chlabels_data1,
+    dataset = "data1",
+    offset = 0,
+    methods = methods_keep
+  )
+  
+  df_comb_data2 <- load_comb_dataset(
+    file_plan = file_plan_data2,
+    chlabels_by_group = chlabels_data2,
+    dataset = "data2",
+    offset = n_data1,
+    methods = methods_keep
+  )
+  
+  df_comb_all <- bind_rows(df_comb_data1, df_comb_data2) %>%
+    mutate(participant = factor(participant, levels = participant_levels))
+  
+  rm(df_comb_data1, df_comb_data2)
+  gc()
+  
+  full15_ref <- df_full15 %>%
+    filter(method == "CCA") %>%
+    group_by(dataset, participant, channel) %>%
+    summarise(
+      rpeak_full15_clean1 = mean(rpeak[clean == 1], na.rm = TRUE),
+      rpeak_full15_best = min(rpeak, na.rm = TRUE),
+      clean_full15_best = clean[which.min(rpeak)][1],
+      sesoi_subj_channel = sesoi_prop * abs(rpeak_full15_clean1),
+      .groups = "drop"
+    ) %>%
+    filter(
+      is.finite(rpeak_full15_clean1),
+      is.finite(rpeak_full15_best),
+      is.finite(sesoi_subj_channel),
+      sesoi_subj_channel > 0
+    )
+  
+  rm(df_full15)
+  gc()
+  
+  comb_best <- df_comb_all %>%
+    filter(method == "CCA") %>%
+    select(dataset, participant, n_ecg_leads, clean, channel, combination_id, ecg_leads, rpeak) %>%
+    group_by(dataset, participant, n_ecg_leads, channel, combination_id, ecg_leads) %>%
+    summarise(
+      best_i = which.min(rpeak)[1],
+      rpeak_reduced_best = rpeak[best_i],
+      clean_reduced_best = clean[best_i],
+      .groups = "drop"
+    ) %>%
+    select(-best_i)
+  
+  rm(df_comb_all)
+  gc()
+  
+  comb_best %>%
+    left_join(full15_ref, by = c("dataset", "participant", "channel")) %>%
+    mutate(
+      delta_vs_full15 = rpeak_reduced_best - rpeak_full15_best,
+      delta_vs_full15_sesoi_units = delta_vs_full15 / sesoi_subj_channel,
+      delta_vs_full15_pct_baseline = 100 * delta_vs_full15 / abs(rpeak_full15_clean1),
+      performs_as_well_as_full15 = delta_vs_full15 <= sesoi_subj_channel,
+      practically_same_as_full15 = abs(delta_vs_full15) <= sesoi_subj_channel,
+      better_than_full15_by_sesoi = delta_vs_full15 < -sesoi_subj_channel,
+      worse_than_full15_by_sesoi = delta_vs_full15 > sesoi_subj_channel,
+      performance_class = case_when(
+        better_than_full15_by_sesoi ~ "better than full 15 > SESOI",
+        practically_same_as_full15 ~ "same as full 15 ± SESOI",
+        worse_than_full15_by_sesoi ~ "worse than full 15 > SESOI",
+        TRUE ~ NA_character_
+      ),
+      full15_improvement = rpeak_full15_clean1 - rpeak_full15_best,
+      reduced_improvement = rpeak_full15_clean1 - rpeak_reduced_best,
+      pct_full15_improvement_recovered = if_else(
+        full15_improvement > 0,
+        100 * reduced_improvement / full15_improvement,
+        NA_real_
+      )
+    )
+}
+
+if (isTRUE(params$recompute_scored_data) || !file.exists(settings$scored_file)) {
+  cca_comb_vs_full15 <- recompute_combination_scores()
+  saveRDS(cca_comb_vs_full15, settings$scored_file)
+} else {
+  cca_comb_vs_full15 <- readRDS(settings$scored_file)
+}
+
+needed_cols <- c(
+  "dataset", "participant", "channel", "n_ecg_leads", "combination_id", "ecg_leads",
+  "rpeak_full15_clean1", "rpeak_full15_best", "rpeak_reduced_best",
+  "clean_full15_best", "clean_reduced_best", "sesoi_subj_channel",
+  "delta_vs_full15", "delta_vs_full15_sesoi_units", "delta_vs_full15_pct_baseline",
+  "performs_as_well_as_full15", "practically_same_as_full15",
+  "better_than_full15_by_sesoi", "worse_than_full15_by_sesoi",
+  "full15_improvement", "pct_full15_improvement_recovered"
+)
+missing_cols <- setdiff(needed_cols, names(cca_comb_vs_full15))
+if (length(missing_cols) > 0) {
+  stop("Missing required columns in cca_comb_vs_full15: ", paste(missing_cols, collapse = ", "))
+}
+
+cca_scored_light <- cca_comb_vs_full15 %>%
+  filter(n_ecg_leads <= 5) %>%
+  transmute(
+    dataset = as.character(dataset),
+    participant = as.character(participant),
+    channel = as.character(channel),
+    n_ecg_leads = as.integer(n_ecg_leads),
+    combination_id = as.integer(combination_id),
+    ecg_leads = as.character(ecg_leads),
+    combo_uid = make_combo_uid(n_ecg_leads, combination_id, ecg_leads),
+    rpeak_full15_clean1,
+    rpeak_full15_best,
+    rpeak_reduced_best,
+    clean_full15_best,
+    clean_reduced_best,
+    components_removed_full15_best = clean_full15_best - 1L,
+    components_removed_reduced_best = clean_reduced_best - 1L,
+    sesoi = sesoi_subj_channel,
+    delta_vs_full15,
+    loss_sesoi_units = delta_vs_full15_sesoi_units,
+    loss_pct_baseline = delta_vs_full15_pct_baseline,
+    performs_as_well = as.logical(performs_as_well_as_full15),
+    practically_same = as.logical(practically_same_as_full15),
+    better_by_sesoi = as.logical(better_than_full15_by_sesoi),
+    worse_by_sesoi = as.logical(worse_than_full15_by_sesoi),
+    full15_improvement,
+    reduced_improvement = rpeak_full15_clean1 - rpeak_reduced_best,
+    pct_full15_improvement_recovered
+  )
+
+rm(cca_comb_vs_full15)
+gc()
+
+manifest[["00_scored_light"]] <- save_table(cca_scored_light, "00_scored_light", csv = FALSE)
+```
+
+# Accounting and ECG-channel-count overview
+
+```{r accounting-and-ECG-channel-count}
+analysis_accounting <- list()
+
+analysis_accounting$sample <- cca_scored_light %>%
+  distinct(dataset, participant, channel) %>%
+  summarise(
+    n_datasets = n_distinct(dataset),
+    n_participants = n_distinct(participant),
+    n_participant_channel_cells = n(),
+    n_unique_eeg_channels = n_distinct(channel),
+    median_channels_per_participant = median(table(participant)),
+    min_channels_per_participant = min(table(participant)),
+    max_channels_per_participant = max(table(participant)),
+    .groups = "drop"
+  )
+
+analysis_accounting$combination_counts <- cca_scored_light %>%
+  distinct(n_ecg_leads, combination_id, ecg_leads) %>%
+  group_by(n_ecg_leads) %>%
+  summarise(
+    n_exact_combinations = n(),
+    expected_n_exact_combinations = choose(15, first(n_ecg_leads)),
+    top20_pool_n = n_top_prop(n_exact_combinations),
+    top20_pool_pct = 100 * top20_pool_n / n_exact_combinations,
+    .groups = "drop"
+  )
+
+ecg_channel_count_overview <- cca_scored_light %>%
+  group_by(n_ecg_leads) %>%
+  summarise(
+    n_rows = n(),
+    n_participants = n_distinct(participant),
+    n_channels = n_distinct(channel),
+    n_exact_combinations = n_distinct(combination_id),
+    top20_pool_n = n_top_prop(n_exact_combinations),
+    pct_rows_as_well = 100 * mean(performs_as_well, na.rm = TRUE),
+    pct_rows_better = 100 * mean(better_by_sesoi, na.rm = TRUE),
+    pct_rows_same = 100 * mean(practically_same, na.rm = TRUE),
+    pct_rows_worse = 100 * mean(worse_by_sesoi, na.rm = TRUE),
+    median_loss_sesoi_units = median(loss_sesoi_units, na.rm = TRUE),
+    q75_loss_sesoi_units = safe_q(loss_sesoi_units, 0.75),
+    q90_loss_sesoi_units = safe_q(loss_sesoi_units, 0.90),
+    median_loss_pct_baseline = median(loss_pct_baseline, na.rm = TRUE),
+    q90_loss_pct_baseline = safe_q(loss_pct_baseline, 0.90),
+    median_pct_full15_improvement_recovered = median(pct_full15_improvement_recovered, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+manifest[["01_accounting_sample"]] <- save_table(analysis_accounting$sample, "01_accounting_sample")
+manifest[["01_combination_counts"]] <- save_table(analysis_accounting$combination_counts, "01_combination_counts")
+manifest[["02_ecg_channel_count_overview"]] <- save_table(ecg_channel_count_overview, "02_ecg_channel_count_overview")
+
+kable_clean(analysis_accounting$sample, digits = 2)
+kable_clean(analysis_accounting$combination_counts, digits = 2)
+kable_clean(ecg_channel_count_overview, digits = 2)
+```
+
+# Exact-combination summaries
+
+```{r exact-combination-summaries}
+rank_exact_summary <- function(x) {
+  x %>%
+    arrange(
+      n_ecg_leads,
+      desc(median_pct_channels_as_well),
+      desc(mean_pct_channels_as_well),
+      desc(q25_pct_channels_as_well),
+      desc(n_participants_ge50_channels),
+      median_q90_loss_sesoi_units,
+      median_loss_sesoi_units,
+      ecg_leads
+    ) %>%
+    group_by(n_ecg_leads) %>%
+    mutate(rank_within_n = row_number()) %>%
+    ungroup()
+}
+
+make_exact_participant_summary <- function(data) {
+  data %>%
+    group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid, participant) %>%
+    summarise(
+      n_channels_available = n_distinct(channel),
+      n_channels_as_well = sum(performs_as_well, na.rm = TRUE),
+      pct_channels_as_well = 100 * n_channels_as_well / n_channels_available,
+      median_loss_sesoi_units = median(loss_sesoi_units, na.rm = TRUE),
+      q75_loss_sesoi_units = safe_q(loss_sesoi_units, 0.75),
+      q90_loss_sesoi_units = safe_q(loss_sesoi_units, 0.90),
+      median_loss_pct_baseline = median(loss_pct_baseline, na.rm = TRUE),
+      q90_loss_pct_baseline = safe_q(loss_pct_baseline, 0.90),
+      median_pct_full15_improvement_recovered = median(pct_full15_improvement_recovered, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      participant_pass_25 = pct_channels_as_well >= 25,
+      participant_pass_50 = pct_channels_as_well >= 50,
+      participant_pass_60 = pct_channels_as_well >= 60,
+      participant_pass_75 = pct_channels_as_well >= 75,
+      participant_pass_90 = pct_channels_as_well >= 90
+    )
+}
+
+make_exact_summary_from_participant <- function(participant_summary) {
+  participant_summary %>%
+    group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid) %>%
+    summarise(
+      n_participants_total = n_distinct(participant),
+      mean_pct_channels_as_well = mean(pct_channels_as_well, na.rm = TRUE),
+      median_pct_channels_as_well = median(pct_channels_as_well, na.rm = TRUE),
+      q25_pct_channels_as_well = safe_q(pct_channels_as_well, 0.25),
+      q75_pct_channels_as_well = safe_q(pct_channels_as_well, 0.75),
+      min_pct_channels_as_well = min(pct_channels_as_well, na.rm = TRUE),
+      n_participants_ge25_channels = sum(participant_pass_25, na.rm = TRUE),
+      n_participants_ge50_channels = sum(participant_pass_50, na.rm = TRUE),
+      n_participants_ge60_channels = sum(participant_pass_60, na.rm = TRUE),
+      n_participants_ge75_channels = sum(participant_pass_75, na.rm = TRUE),
+      n_participants_ge90_channels = sum(participant_pass_90, na.rm = TRUE),
+      median_loss_sesoi_units = median(median_loss_sesoi_units, na.rm = TRUE),
+      median_q75_loss_sesoi_units = median(q75_loss_sesoi_units, na.rm = TRUE),
+      median_q90_loss_sesoi_units = median(q90_loss_sesoi_units, na.rm = TRUE),
+      worst_participant_q90_loss_sesoi_units = max(q90_loss_sesoi_units, na.rm = TRUE),
+      median_loss_pct_baseline = median(median_loss_pct_baseline, na.rm = TRUE),
+      median_q90_loss_pct_baseline = median(q90_loss_pct_baseline, na.rm = TRUE),
+      median_pct_full15_improvement_recovered = median(median_pct_full15_improvement_recovered, na.rm = TRUE),
+      participants_ge50 = paste(sort(unique(as.character(participant[participant_pass_50]))), collapse = ","),
+      participants_ge75 = paste(sort(unique(as.character(participant[participant_pass_75]))), collapse = ","),
+      .groups = "drop"
+    ) %>%
+    rank_exact_summary()
+}
+
+exact_participant_summary_all <- make_exact_participant_summary(cca_scored_light)
+
+exact_cell_summary_all <- cca_scored_light %>%
+  group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid) %>%
+  summarise(
+    n_participant_channel_cells = n(),
+    n_participants_cell = n_distinct(participant),
+    n_channels_cell = n_distinct(channel),
+    pct_cells_as_well = 100 * mean(performs_as_well, na.rm = TRUE),
+    pct_cells_better = 100 * mean(better_by_sesoi, na.rm = TRUE),
+    pct_cells_same = 100 * mean(practically_same, na.rm = TRUE),
+    pct_cells_worse = 100 * mean(worse_by_sesoi, na.rm = TRUE),
+    median_cell_loss_sesoi_units = median(loss_sesoi_units, na.rm = TRUE),
+    q90_cell_loss_sesoi_units = safe_q(loss_sesoi_units, 0.90),
+    median_cell_loss_pct_baseline = median(loss_pct_baseline, na.rm = TRUE),
+    q90_cell_loss_pct_baseline = safe_q(loss_pct_baseline, 0.90),
+    .groups = "drop"
+  )
+
+exact_summary_all <- make_exact_summary_from_participant(exact_participant_summary_all) %>%
+  left_join(
+    exact_cell_summary_all,
+    by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")
+  )
+
+exact_channel_summary_all <- cca_scored_light %>%
+  group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid, channel) %>%
+  summarise(
+    n_participants = n_distinct(participant),
+    n_participants_as_well = sum(performs_as_well, na.rm = TRUE),
+    pct_participants_as_well = 100 * mean(performs_as_well, na.rm = TRUE),
+    median_loss_sesoi_units = median(loss_sesoi_units, na.rm = TRUE),
+    q90_loss_sesoi_units = safe_q(loss_sesoi_units, 0.90),
+    median_loss_pct_baseline = median(loss_pct_baseline, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+manifest[["03_exact_participant_summary_all"]] <- save_table(exact_participant_summary_all, "03_exact_participant_summary_all", csv = FALSE)
+manifest[["04_exact_cell_summary_all"]] <- save_table(exact_cell_summary_all, "04_exact_cell_summary_all")
+manifest[["04_exact_summary_all"]] <- save_table(exact_summary_all, "04_exact_summary_all")
+manifest[["05_exact_channel_summary_all"]] <- save_table(exact_channel_summary_all, "05_exact_channel_summary_all", csv = FALSE)
+
+top_exact_table <- exact_summary_all %>%
+  group_by(n_ecg_leads) %>%
+  slice_head(n = settings$top_exact_n_for_plots) %>%
+  ungroup() %>%
+  select(
+    n_ecg_leads,
+    rank_within_n,
+    ecg_leads,
+    median_pct_channels_as_well,
+    q25_pct_channels_as_well,
+    q75_pct_channels_as_well,
+    mean_pct_channels_as_well,
+    pct_cells_as_well,
+    pct_cells_worse,
+    n_participant_channel_cells,
+    n_participants_ge50_channels,
+    n_participants_total,
+    median_loss_sesoi_units,
+    median_q90_loss_sesoi_units,
+    median_loss_pct_baseline,
+    median_pct_full15_improvement_recovered,
+    participants_ge50
+  )
+
+manifest[["06_top_exact_table"]] <- save_table(top_exact_table, "06_top_exact_table")
+kable_clean(top_exact_table, digits = 2)
+```
+
+# Main exact-combination bar plot
+
+Bars show the median participant-level percentage of EEG channels not meaningfully worse than full 15. Error bars show participant IQR. Text shows the number of participants for whom the combination worked in at least 50% of EEG channels.
+
+```{r plot-main-top-exact, fig.width=12, fig.height=8}
+plot_exact_top <- exact_summary_all %>%
+  group_by(n_ecg_leads) %>%
+  slice_head(n = settings$top_exact_n_for_plots) %>%
+  ungroup() %>%
+  mutate(
+    support_label = paste0(n_participants_ge50_channels, "/", n_participants_total),
+    plot_label = paste0(ecg_leads, "___", n_ecg_leads),
+    plot_rank = n_ecg_leads * 100000 + rank_within_n,
+    plot_label = factor(plot_label, levels = rev(plot_label[order(plot_rank)])),
+    label_y = pmin(112, pmax(median_pct_channels_as_well, q75_pct_channels_as_well, na.rm = TRUE) + 4)
+  )
+
+p_top_exact <- ggplot(
+  plot_exact_top,
+  aes(x = plot_label, y = median_pct_channels_as_well, fill = n_participants_ge50_channels)
+) +
+  geom_col(width = 0.75) +
+  geom_errorbar(
+    aes(ymin = q25_pct_channels_as_well, ymax = q75_pct_channels_as_well),
+    width = 0.20,
+    linewidth = 0.35
+  ) +
+  geom_text(aes(y = label_y, label = support_label), hjust = 0, size = 3, family = fig_font_family) +
+  coord_flip(clip = "off") +
+  facet_wrap(~ n_ecg_leads, scales = "free_y", labeller = labeller(n_ecg_leads = function(x) paste0(x, " ECG channels"))) +
+  scale_x_discrete(labels = function(x) sub("___.*$", "", x)) +
+  scale_y_continuous(limits = c(0, 115), expand = expansion(mult = c(0, 0.04))) +
+  scale_fill_cca_heat(limits = c(0, max(plot_exact_top$n_participants_total)), breaks = 0:max(plot_exact_top$n_participants_total)) +
+  labs(
+    x = "Exact ECG-channel combination",
+    y = "Median % EEG channels as good as full 15",
+    fill = "Participants\n≥50% channels",
+    title = "Top exact reduced ECG combinations",
+    subtitle = "Bars show median participant-level EEG-channel coverage; error bars show interquartile range"
+  ) +
+  theme_pub +
+  theme(plot.margin = margin(5.5, 55, 5.5, 5.5))
+
+p_top_exact
+save_plot_both(p_top_exact, "p3_top_exact_combinations", width = 12, height = 8)
+```
+
+# ECG-channel-count performance and loss distributions
+
+```{r plot-ecg-channel-count-and-loss, fig.width=10, fig.height=4.5}
+ecg_channel_count_overview_data <- exact_summary_all %>%
+  mutate(
+    n_ecg_leads_f = factor(n_ecg_leads),
+    is_top_display = rank_within_n <= settings$top_exact_n_for_plots
+  )
+
+p_ecg_channel_count <- ggplot(
+  ecg_channel_count_overview_data,
+  aes(x = n_ecg_leads_f, y = median_pct_channels_as_well)
+) +
+  geom_violin(fill = "grey92", colour = "grey55", linewidth = 0.25, scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.14, outlier.shape = NA, fill = "white", colour = "grey35", linewidth = 0.35) +
+  geom_point(
+    data = ecg_channel_count_overview_data %>% filter(!is_top_display),
+    position = position_jitter(width = 0.10, height = 0),
+    alpha = 0.08,
+    size = 0.45,
+    colour = "grey20"
+  ) +
+  geom_point(
+    data = ecg_channel_count_overview_data %>% filter(is_top_display),
+    position = position_jitter(width = 0.08, height = 0),
+    alpha = 0.90,
+    size = 1.4,
+    colour = highlight_cols$accent
+  ) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(
+    title = "Reduced-channel performance by ECG-channel count",
+    subtitle = paste0("Each point is one exact ECG combination; top ", settings$top_exact_n_for_plots, " per ECG-channel count highlighted"),
+    x = "Number of ECG channels",
+    y = "Median % EEG channels as good as full 15"
+  ) +
+  theme_pub
+
+best_candidate_per_n <- exact_summary_all %>%
+  group_by(n_ecg_leads) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  mutate(
+    n_ecg_leads_f = factor(n_ecg_leads),
+    candidate_label = paste0(n_ecg_leads, " ECG channels: ", ecg_leads)
+  )
+
+best_loss_data <- cca_scored_light %>%
+  semi_join(best_candidate_per_n %>% select(n_ecg_leads, combination_id, ecg_leads), by = c("n_ecg_leads", "combination_id", "ecg_leads")) %>%
+  left_join(best_candidate_per_n %>% select(n_ecg_leads, combination_id, ecg_leads, candidate_label), by = c("n_ecg_leads", "combination_id", "ecg_leads")) %>%
+  mutate(
+    n_ecg_leads_f = factor(n_ecg_leads),
+    candidate_label = factor(candidate_label, levels = best_candidate_per_n$candidate_label)
+  )
+
+p_best_loss <- ggplot(best_loss_data, aes(x = n_ecg_leads_f, y = loss_sesoi_units)) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.45, colour = highlight_cols$zero_line) +
+  geom_hline(yintercept = 0, linewidth = 0.35, colour = "grey30") +
+  geom_boxplot(width = 0.55, outlier.alpha = 0.12, linewidth = 0.35, fill = "grey85") +
+  coord_cartesian(ylim = safe_q(best_loss_data$loss_sesoi_units, 0.98) * c(-0.10, 1.05)) +
+  labs(
+    title = "Loss of best candidate per ECG-channel count",
+    subtitle = "Dashed line marks the non-inferiority boundary: 1 SESOI unit",
+    x = "Number of ECG channels",
+    y = "Loss versus full 15, SESOI units"
+  ) +
+  theme_pub
+
+p_pct_recovered <- ggplot(
+  ecg_channel_count_overview_data,
+  aes(x = n_ecg_leads_f, y = median_pct_full15_improvement_recovered)
+) +
+  geom_violin(fill = "grey92", colour = "grey55", linewidth = 0.25, scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.14, outlier.shape = NA, fill = "white", colour = "grey35", linewidth = 0.35) +
+  geom_point(
+    data = ecg_channel_count_overview_data %>% filter(!is_top_display),
+    position = position_jitter(width = 0.10, height = 0),
+    alpha = 0.08,
+    size = 0.45,
+    colour = "grey20"
+  ) +
+  geom_point(
+    data = ecg_channel_count_overview_data %>% filter(is_top_display),
+    position = position_jitter(width = 0.08, height = 0),
+    alpha = 0.90,
+    size = 1.4,
+    colour = highlight_cols$accent
+  ) +
+  geom_hline(yintercept = 100, linetype = "dashed", linewidth = 0.45, colour = highlight_cols$zero_line) +
+  coord_cartesian(ylim = c(0, safe_q(ecg_channel_count_overview_data$median_pct_full15_improvement_recovered, 0.98) * 1.05)) +
+  labs(
+    title = "Recovery of full 15-channel improvement by ECG-channel count",
+    subtitle = paste0("Each point is one exact ECG-channel combination; top ", settings$top_exact_n_for_plots, " per ECG-channel count highlighted"),
+    x = "Number of ECG channels",
+    y = "Median % of full 15-channel improvement recovered"
+  ) +
+  theme_pub
+
+best_recovered_data <- best_loss_data %>%
+  filter(is.finite(pct_full15_improvement_recovered))
+
+p_best_recovered <- ggplot(best_recovered_data, aes(x = n_ecg_leads_f, y = pct_full15_improvement_recovered)) +
+  geom_hline(yintercept = 100, linetype = "dashed", linewidth = 0.45, colour = highlight_cols$zero_line) +
+  geom_boxplot(width = 0.55, outlier.alpha = 0.12, linewidth = 0.35, fill = "grey85") +
+  coord_cartesian(ylim = c(0, safe_q(best_recovered_data$pct_full15_improvement_recovered, 0.98) * 1.05)) +
+  labs(
+    title = "Recovery of full 15-channel improvement for best candidates",
+    subtitle = "Dashed line marks 100% of the full 15-channel improvement",
+    x = "Number of ECG channels",
+    y = "% full 15-channel improvement recovered"
+  ) +
+  theme_pub
+
+p_ecg_channel_count
+p_best_loss
+p_pct_recovered
+p_best_recovered
+save_plot_both(p_ecg_channel_count, "p3_ecg_channel_count_overview", width = 8, height = 4.5)
+save_plot_both(p_best_loss, "p3_best_candidate_loss", width = 6, height = 4.5)
+save_plot_both(p_pct_recovered, "p3_pct_full15_improvement_recovered_by_count", width = 8, height = 4.5)
+save_plot_both(p_best_recovered, "p3_best_candidate_pct_full15_recovered", width = 6, height = 4.5)
+```
+
+# Participant and channel robustness heatmaps
+
+```{r robustness-heatmaps, fig.width=12, fig.height=8}
+top_heatmap_candidates <- exact_summary_all %>%
+  group_by(n_ecg_leads) %>%
+  slice_head(n = settings$top_exact_n_for_plots) %>%
+  ungroup() %>%
+  mutate(
+    candidate_label = paste0(n_ecg_leads, " ECG channels / rank ", rank_within_n, ": ", ecg_leads)
+  ) %>%
+  select(n_ecg_leads, combination_id, ecg_leads, combo_uid, rank_within_n, candidate_label)
+
+participant_heatmap_data <- exact_participant_summary_all %>%
+  semi_join(top_heatmap_candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+  left_join(top_heatmap_candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+  mutate(
+    candidate_label = factor(candidate_label, levels = rev(top_heatmap_candidates$candidate_label)),
+    participant = factor(participant, levels = sort(unique(participant)))
+  )
+
+p_participant_heatmap <- ggplot(
+  participant_heatmap_data,
+  aes(x = participant, y = candidate_label, fill = pct_channels_as_well)
+) +
+  geom_tile(colour = "white", linewidth = 0.15) +
+  facet_wrap(~ n_ecg_leads, scales = "free_y", labeller = labeller(n_ecg_leads = function(x) paste0(x, " ECG channels"))) +
+  scale_fill_cca_heat(limits = c(0, 100)) +
+  labs(
+    x = "Participant",
+    y = "Top exact ECG combination",
+    fill = "% EEG channels\nas good as full 15",
+    title = "Participant robustness of top reduced ECG combinations",
+    subtitle = paste0("Top ", settings$top_exact_n_for_plots, " exact combinations per ECG-channel count")
+  ) +
+  theme_pub +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+channel_summary_top <- exact_channel_summary_all %>%
+  semi_join(top_heatmap_candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+  left_join(top_heatmap_candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid"))
+
+channel_order <- channel_summary_top %>%
+  group_by(channel) %>%
+  summarise(mean_pct_participants_as_well = mean(pct_participants_as_well, na.rm = TRUE), .groups = "drop") %>%
+  arrange(mean_pct_participants_as_well) %>%
+  pull(channel)
+
+channel_summary_top <- channel_summary_top %>%
+  mutate(
+    channel = factor(channel, levels = channel_order),
+    candidate_label = factor(candidate_label, levels = rev(top_heatmap_candidates$candidate_label))
+  )
+
+p_channel_heatmap <- ggplot(
+  channel_summary_top,
+  aes(x = channel, y = candidate_label, fill = pct_participants_as_well)
+) +
+  geom_tile(colour = "white", linewidth = 0.15) +
+  facet_wrap(~ n_ecg_leads, scales = "free_y", labeller = labeller(n_ecg_leads = function(x) paste0(x, " ECG channels"))) +
+  scale_fill_cca_heat(limits = c(0, 100)) +
+  labs(
+    x = "EEG channel",
+    y = "Top exact ECG combination",
+    fill = "% participants\nas good as full 15",
+    title = "Channel robustness of top reduced ECG combinations",
+    subtitle = paste0("Top ", settings$top_exact_n_for_plots, " exact combinations per ECG-channel count")
+  ) +
+  theme_pub +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+manifest[["07_top_heatmap_candidates"]] <- save_table(top_heatmap_candidates, "07_top_heatmap_candidates")
+manifest[["08_participant_heatmap_data"]] <- save_table(participant_heatmap_data, "08_participant_heatmap_data", csv = FALSE)
+manifest[["09_channel_heatmap_data"]] <- save_table(channel_summary_top, "09_channel_heatmap_data", csv = FALSE)
+
+p_participant_heatmap
+p_channel_heatmap
+save_plot_both(p_participant_heatmap, "p3_participant_robustness_heatmap", width = 12, height = 8)
+save_plot_both(p_channel_heatmap, "p3_channel_robustness_heatmap", width = 12, height = 8)
+```
+
+# Participant- and EEG-channel top-20% validation
+
+This section evaluates recurrence without splitting the data by dataset. For each participant and for each EEG channel separately, exact ECG-channel combinations are ranked within each ECG-channel count, and the top 20% pool is identified. The bar plot shows how often each exact combination recurs in those unit-specific top-20% pools.
+
+```{r participant-channel-top20-validation, fig.width=12, fig.height=8}
+participant_total <- n_distinct(exact_participant_summary_all$participant)
+channel_total <- n_distinct(exact_channel_summary_all$channel)
+
+participant_exact_ranked_top20 <- exact_participant_summary_all %>%
+  group_by(participant, n_ecg_leads) %>%
+  arrange(
+    desc(pct_channels_as_well),
+    median_loss_sesoi_units,
+    q90_loss_sesoi_units,
+    ecg_leads,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    unit_rank = row_number(),
+    top20_cutoff = n_top_prop(n()),
+    in_top20 = unit_rank <= top20_cutoff
+  ) %>%
+  ungroup()
+
+channel_exact_ranked_top20 <- exact_channel_summary_all %>%
+  group_by(channel, n_ecg_leads) %>%
+  arrange(
+    desc(pct_participants_as_well),
+    median_loss_sesoi_units,
+    q90_loss_sesoi_units,
+    ecg_leads,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    unit_rank = row_number(),
+    top20_cutoff = n_top_prop(n()),
+    in_top20 = unit_rank <= top20_cutoff
+  ) %>%
+  ungroup()
+
+participant_top20_exact_frequency <- participant_exact_ranked_top20 %>%
+  filter(in_top20) %>%
+  group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid) %>%
+  summarise(
+    validation_level = "Participant-specific top 20%",
+    n_units_in_top20 = n_distinct(participant),
+    n_units_total = participant_total,
+    pct_units_in_top20 = 100 * n_units_in_top20 / n_units_total,
+    median_rank_when_top20 = median(unit_rank, na.rm = TRUE),
+    median_performance_when_top20 = median(pct_channels_as_well, na.rm = TRUE),
+    median_loss_when_top20 = median(median_loss_sesoi_units, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+channel_top20_exact_frequency <- channel_exact_ranked_top20 %>%
+  filter(in_top20) %>%
+  group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid) %>%
+  summarise(
+    validation_level = "EEG-channel-specific top 20%",
+    n_units_in_top20 = n_distinct(channel),
+    n_units_total = channel_total,
+    pct_units_in_top20 = 100 * n_units_in_top20 / n_units_total,
+    median_rank_when_top20 = median(unit_rank, na.rm = TRUE),
+    median_performance_when_top20 = median(pct_participants_as_well, na.rm = TRUE),
+    median_loss_when_top20 = median(median_loss_sesoi_units, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+validation_top20_exact_frequency <- bind_rows(
+  participant_top20_exact_frequency,
+  channel_top20_exact_frequency
+) %>%
+  arrange(
+    validation_level,
+    n_ecg_leads,
+    desc(pct_units_in_top20),
+    median_rank_when_top20,
+    ecg_leads
+  )
+
+validation_frequency_plot_data <- validation_top20_exact_frequency %>%
+  group_by(validation_level, n_ecg_leads) %>%
+  slice_head(n = settings$top_exact_n_for_plots) %>%
+  ungroup() %>%
+  mutate(
+    validation_level = factor(
+      validation_level,
+      levels = c("Participant-specific top 20%", "EEG-channel-specific top 20%")
+    ),
+    plot_label = paste0(ecg_leads, "___", validation_level, "___", n_ecg_leads),
+    plot_rank = pct_units_in_top20 + 0.001 * (1000 - median_rank_when_top20),
+    plot_label = reorder(plot_label, plot_rank)
+  )
+
+p_validation_top20_frequency <- ggplot(
+  validation_frequency_plot_data,
+  aes(x = plot_label, y = pct_units_in_top20, fill = validation_level)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(n_units_in_top20, "/", n_units_total)),
+    hjust = -0.1,
+    size = 2.7,
+    family = fig_font_family
+  ) +
+  coord_flip(clip = "off") +
+  facet_grid(validation_level ~ n_ecg_leads, scales = "free_y", space = "free_y", labeller = labeller(n_ecg_leads = function(x) paste0(x, " ECG channels"))) +
+  scale_x_discrete(labels = function(x) sub("___.*$", "", x)) +
+  scale_y_continuous(limits = c(0, 108), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = validation_cols, drop = FALSE) +
+  labs(
+    x = "Exact ECG-channel combination",
+    y = "% validation units where combination is in the top 20%",
+    fill = "Validation level",
+    title = "Exact ECG-channel recurrence in participant- and EEG-channel-specific top-20% pools",
+    subtitle = "Text shows validation units with the combination in their top 20%; cutoff is recalculated within each ECG-channel count"
+  ) +
+  theme_pub +
+  theme(plot.margin = margin(5.5, 55, 5.5, 5.5))
+
+manifest[["10_participant_exact_ranked_top20"]] <- save_table(participant_exact_ranked_top20, "10_participant_exact_ranked_top20", csv = FALSE)
+manifest[["11_channel_exact_ranked_top20"]] <- save_table(channel_exact_ranked_top20, "11_channel_exact_ranked_top20", csv = FALSE)
+manifest[["12_validation_top20_exact_frequency"]] <- save_table(validation_top20_exact_frequency, "12_validation_top20_exact_frequency")
+
+kable_clean(validation_top20_exact_frequency %>% group_by(validation_level, n_ecg_leads) %>% slice_head(n = 10) %>% ungroup(), digits = 2)
+p_validation_top20_frequency
+save_plot_both(p_validation_top20_frequency, "p3_validation_top20_exact_frequency", width = 12, height = 8)
+```
+
+# Participant × EEG-channel robustness for top 5-channel candidates
+
+```{r participant-channel-robustness-5ecgchannels, fig.width=12, fig.height=8}
+top5_ecg_channel_candidates <- exact_summary_all %>%
+  filter(n_ecg_leads == 5) %>%
+  slice_head(n = min(3L, settings$top_exact_n_for_plots)) %>%
+  mutate(
+    candidate_label = paste0("5 ECG channels / rank ", rank_within_n, ": ", ecg_leads)
+  ) %>%
+  select(n_ecg_leads, combination_id, ecg_leads, combo_uid, rank_within_n, candidate_label)
+
+if (nrow(top5_ecg_channel_candidates) > 0) {
+  if (!exists("channel_order") || length(channel_order) == 0) {
+    channel_order <- sort(unique(cca_scored_light$channel))
+  }
+  
+  participant_channel_heatmap_5ecg <- cca_scored_light %>%
+    semi_join(top5_ecg_channel_candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+    left_join(top5_ecg_channel_candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+    mutate(
+      participant = factor(participant, levels = sort(unique(participant))),
+      channel = factor(channel, levels = channel_order),
+      candidate_label = factor(candidate_label, levels = top5_ecg_channel_candidates$candidate_label),
+      pass_label = if_else(performs_as_well, "as good as full 15", "worse than full 15")
+    )
+  
+  p_participant_channel_5ecg <- ggplot(
+    participant_channel_heatmap_5ecg,
+    aes(x = channel, y = participant, fill = performs_as_well)
+  ) +
+    geom_tile(colour = "white", linewidth = 0.10) +
+    facet_wrap(~ candidate_label, ncol = 1) +
+    scale_fill_manual(
+      values = status_cols,
+      breaks = c(FALSE, TRUE),
+      labels = c("worse than full 15", "not meaningfully worse")
+    ) +
+    labs(
+      x = "EEG channel",
+      y = "Participant",
+      fill = "Not meaningfully\nworse than full 15",
+      title = "Participant × EEG-channel robustness for top 5-ECG-channel candidates",
+      subtitle = "TRUE means reduced 5-channel CCA was within SESOI of full 15-channel CCA or better"
+    ) +
+    theme_pub +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+  
+  manifest[["13_participant_channel_heatmap_5ecg"]] <- save_table(participant_channel_heatmap_5ecg, "13_participant_channel_heatmap_5ecg", csv = FALSE)
+  print(p_participant_channel_5ecg)
+  save_plot_both(p_participant_channel_5ecg, "p3_participant_channel_robustness_top5ecgchannels", width = 12, height = 8)
+}
+```
+
+# Participant- and channel-level top-20% recurrence
+
+The display plots above may show 5 or 10 candidates, but the recurrence rule here always uses the top `r params$top_prop_main * 100`% within each ECG-channel count.
+
+```{r bootstrap-top20-recurrence, fig.width=12, fig.height=8}
+rank_boot_summary <- function(x) {
+  x %>%
+    arrange(
+      n_ecg_leads,
+      desc(median_pct_channels_as_well),
+      desc(mean_pct_channels_as_well),
+      desc(q25_pct_channels_as_well),
+      median_q90_loss_sesoi_units,
+      median_loss_sesoi_units,
+      ecg_leads
+    ) %>%
+    group_by(n_ecg_leads) %>%
+    mutate(
+      boot_rank = row_number(),
+      top20_cutoff = n_top_prop(n()),
+      in_top20 = boot_rank <= top20_cutoff
+    ) %>%
+    ungroup()
+}
+
+rank_channel_boot_summary <- function(channel_summary) {
+  channel_summary %>%
+    group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid) %>%
+    summarise(
+      mean_pct_channels_as_well = mean(pct_participants_as_well, na.rm = TRUE),
+      median_pct_channels_as_well = median(pct_participants_as_well, na.rm = TRUE),
+      q25_pct_channels_as_well = safe_q(pct_participants_as_well, 0.25),
+      median_loss_sesoi_units = median(median_loss_sesoi_units, na.rm = TRUE),
+      median_q90_loss_sesoi_units = median(q90_loss_sesoi_units, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rank_boot_summary()
+}
+
+stability_candidates <- exact_summary_all %>%
+  group_by(n_ecg_leads) %>%
+  slice_head(n = settings$top_exact_n_for_plots) %>%
+  ungroup() %>%
+  select(n_ecg_leads, combination_id, ecg_leads, combo_uid, original_rank = rank_within_n)
+
+run_participant_boot_once <- function(b, participant_summary, participants, candidates) {
+  sampled_participants <- tibble(
+    participant = sample(participants, size = length(participants), replace = TRUE),
+    draw_id = seq_along(participants)
+  )
+  
+  boot_summary <- sampled_participants %>%
+    left_join(participant_summary, by = "participant", relationship = "many-to-many") %>%
+    group_by(n_ecg_leads, combination_id, ecg_leads, combo_uid) %>%
+    summarise(
+      mean_pct_channels_as_well = mean(pct_channels_as_well, na.rm = TRUE),
+      median_pct_channels_as_well = median(pct_channels_as_well, na.rm = TRUE),
+      q25_pct_channels_as_well = safe_q(pct_channels_as_well, 0.25),
+      median_loss_sesoi_units = median(median_loss_sesoi_units, na.rm = TRUE),
+      median_q90_loss_sesoi_units = median(q90_loss_sesoi_units, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rank_boot_summary()
+  
+  candidate_ranks <- boot_summary %>%
+    semi_join(candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+    transmute(
+      bootstrap = b,
+      stability_type = "participant",
+      n_ecg_leads,
+      combination_id,
+      ecg_leads,
+      combo_uid,
+      boot_rank,
+      top20_cutoff,
+      in_top20,
+      mean_pct_channels_as_well,
+      median_pct_channels_as_well,
+      q25_pct_channels_as_well,
+      median_loss_sesoi_units,
+      median_q90_loss_sesoi_units
+    )
+  
+  top20_hits <- boot_summary %>%
+    filter(in_top20) %>%
+    transmute(
+      bootstrap = b,
+      stability_type = "participant",
+      n_ecg_leads,
+      combination_id,
+      ecg_leads,
+      combo_uid,
+      boot_rank,
+      top20_cutoff
+    )
+  
+  list(candidate_ranks = candidate_ranks, top20_hits = top20_hits)
+}
+
+run_channel_boot_once <- function(b, channel_summary, channels, candidates) {
+  sampled_channels <- tibble(
+    channel = sample(channels, size = length(channels), replace = TRUE),
+    draw_id = seq_along(channels)
+  )
+  
+  boot_summary <- sampled_channels %>%
+    left_join(channel_summary, by = "channel", relationship = "many-to-many") %>%
+    rank_channel_boot_summary()
+  
+  candidate_ranks <- boot_summary %>%
+    semi_join(candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+    transmute(
+      bootstrap = b,
+      stability_type = "channel",
+      n_ecg_leads,
+      combination_id,
+      ecg_leads,
+      combo_uid,
+      boot_rank,
+      top20_cutoff,
+      in_top20,
+      mean_pct_channels_as_well,
+      median_pct_channels_as_well,
+      q25_pct_channels_as_well,
+      median_loss_sesoi_units,
+      median_q90_loss_sesoi_units
+    )
+  
+  top20_hits <- boot_summary %>%
+    filter(in_top20) %>%
+    transmute(
+      bootstrap = b,
+      stability_type = "channel",
+      n_ecg_leads,
+      combination_id,
+      ecg_leads,
+      combo_uid,
+      boot_rank,
+      top20_cutoff
+    )
+  
+  list(candidate_ranks = candidate_ranks, top20_hits = top20_hits)
+}
+
+bootstrap_candidate_summary_all <- tibble()
+bootstrap_top20_exact_frequency <- tibble()
+bootstrap_candidate_ranks_all <- tibble()
+bootstrap_top20_hits_all <- tibble()
+
+if (isTRUE(settings$run_bootstrap)) {
+  set.seed(settings$bootstrap_seed)
+  participants_all <- sort(unique(exact_participant_summary_all$participant))
+  channels_all <- sort(unique(exact_channel_summary_all$channel))
+  
+  participant_boot_list <- map(
+    seq_len(settings$n_boot),
+    run_participant_boot_once,
+    participant_summary = exact_participant_summary_all,
+    participants = participants_all,
+    candidates = stability_candidates
+  )
+  
+  channel_boot_list <- map(
+    seq_len(settings$n_boot),
+    run_channel_boot_once,
+    channel_summary = exact_channel_summary_all,
+    channels = channels_all,
+    candidates = stability_candidates
+  )
+  
+  bootstrap_candidate_ranks_all <- bind_rows(
+    map_dfr(participant_boot_list, "candidate_ranks"),
+    map_dfr(channel_boot_list, "candidate_ranks")
+  )
+  
+  bootstrap_top20_hits_all <- bind_rows(
+    map_dfr(participant_boot_list, "top20_hits"),
+    map_dfr(channel_boot_list, "top20_hits")
+  )
+  
+  rm(participant_boot_list, channel_boot_list)
+  gc()
+  
+  bootstrap_candidate_summary_all <- bootstrap_candidate_ranks_all %>%
+    left_join(stability_candidates, by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")) %>%
+    group_by(stability_type, n_ecg_leads, combination_id, ecg_leads, combo_uid, original_rank) %>%
+    summarise(
+      n_boot = n_distinct(bootstrap),
+      median_boot_rank = median(boot_rank, na.rm = TRUE),
+      q25_boot_rank = safe_q(boot_rank, 0.25),
+      q75_boot_rank = safe_q(boot_rank, 0.75),
+      q90_boot_rank = safe_q(boot_rank, 0.90),
+      median_top20_cutoff = median(top20_cutoff, na.rm = TRUE),
+      pct_boot_top20 = 100 * mean(in_top20, na.rm = TRUE),
+      pct_boot_top10 = 100 * mean(boot_rank <= 10, na.rm = TRUE),
+      median_boot_median_pct_channels_as_well = median(median_pct_channels_as_well, na.rm = TRUE),
+      median_boot_q25_pct_channels_as_well = median(q25_pct_channels_as_well, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(n_ecg_leads, original_rank, stability_type)
+  
+  bootstrap_top20_exact_frequency <- bootstrap_top20_hits_all %>%
+    group_by(stability_type, n_ecg_leads, combination_id, ecg_leads, combo_uid) %>%
+    summarise(
+      n_boot_in_top20 = n_distinct(bootstrap),
+      pct_boot_in_top20 = 100 * n_boot_in_top20 / settings$n_boot,
+      median_boot_rank_when_in_top20 = median(boot_rank, na.rm = TRUE),
+      median_top20_cutoff = median(top20_cutoff, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(
+      exact_summary_all %>% select(n_ecg_leads, combination_id, ecg_leads, combo_uid, original_rank = rank_within_n, median_pct_channels_as_well, median_loss_sesoi_units),
+      by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")
+    ) %>%
+    arrange(stability_type, n_ecg_leads, desc(pct_boot_in_top20), original_rank)
+}
+
+manifest[["13_stability_candidates"]] <- save_table(stability_candidates, "13_stability_candidates")
+manifest[["14_bootstrap_candidate_ranks_all"]] <- save_table(bootstrap_candidate_ranks_all, "14_bootstrap_candidate_ranks_all", csv = FALSE)
+manifest[["15_bootstrap_top20_hits_all"]] <- save_table(bootstrap_top20_hits_all, "15_bootstrap_top20_hits_all", csv = FALSE)
+manifest[["16_bootstrap_candidate_summary_all"]] <- save_table(bootstrap_candidate_summary_all, "16_bootstrap_candidate_summary_all")
+manifest[["17_bootstrap_top20_exact_frequency"]] <- save_table(bootstrap_top20_exact_frequency, "17_bootstrap_top20_exact_frequency")
+
+kable_clean(bootstrap_candidate_summary_all, digits = 2)
+```
+
+```{r plot-bootstrap-recurrence, fig.width=12, fig.height=8}
+if (nrow(bootstrap_candidate_summary_all) > 0) {
+  bootstrap_candidate_plot_data <- bootstrap_candidate_summary_all %>%
+    mutate(
+      stability_type = factor(stability_type, levels = c("participant", "channel"), labels = c("Participant resampling", "EEG-channel resampling")),
+      candidate_label = paste0(n_ecg_leads, " ECG channels / rank ", original_rank, ": ", ecg_leads),
+      candidate_label = factor(candidate_label, levels = rev(unique(candidate_label)))
+    )
+  
+  p_bootstrap_candidate_top20 <- ggplot(
+    bootstrap_candidate_plot_data,
+    aes(x = candidate_label, y = pct_boot_top20, fill = stability_type)
+  ) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+    geom_text(
+      aes(label = paste0(round(pct_boot_top20), "%")),
+      position = position_dodge(width = 0.75),
+      hjust = -0.1,
+      size = 2.5,
+      family = fig_font_family
+    ) +
+    coord_flip(clip = "off") +
+    facet_wrap(~ n_ecg_leads, scales = "free_y", labeller = labeller(n_ecg_leads = function(x) paste0(x, " ECG channels"))) +
+    scale_y_continuous(limits = c(0, 108), expand = expansion(mult = c(0, 0.05))) +
+    scale_fill_manual(values = bootstrap_cols, drop = FALSE) +
+    labs(
+      x = "Original top exact ECG combination",
+      y = "% resamples where candidate remains in top 20%",
+      fill = "Resampling level",
+      title = "Top-20% recurrence of original exact ECG candidates",
+      subtitle = "Top-20% cutoff is recalculated separately for each number of ECG channels"
+    ) +
+    theme_pub +
+    theme(plot.margin = margin(5.5, 45, 5.5, 5.5))
+  
+  print(p_bootstrap_candidate_top20)
+  save_plot_both(p_bootstrap_candidate_top20, "p3_bootstrap_candidate_top20_recurrence", width = 12, height = 8)
+}
+
+if (nrow(bootstrap_top20_exact_frequency) > 0) {
+  bootstrap_frequency_plot_data <- bootstrap_top20_exact_frequency %>%
+    group_by(stability_type, n_ecg_leads) %>%
+    slice_head(n = settings$top_exact_n_for_plots) %>%
+    ungroup() %>%
+    mutate(
+      stability_type = factor(stability_type, levels = c("participant", "channel"), labels = c("Participant resampling", "EEG-channel resampling")),
+      plot_label = paste0(ecg_leads, "___", stability_type, "___", n_ecg_leads),
+      plot_rank = pct_boot_in_top20 + 0.001 * (100000 - if_else(is.na(original_rank), 100000, original_rank)),
+      plot_label = reorder(plot_label, plot_rank)
+    )
+  
+  p_bootstrap_top20_frequency <- ggplot(
+    bootstrap_frequency_plot_data,
+    aes(x = plot_label, y = pct_boot_in_top20, fill = stability_type)
+  ) +
+    geom_col() +
+    coord_flip() +
+    facet_grid(stability_type ~ n_ecg_leads, scales = "free_y", space = "free_y", labeller = labeller(n_ecg_leads = function(x) paste0(x, " ECG channels"))) +
+    scale_x_discrete(labels = function(x) sub("___.*$", "", x)) +
+    scale_y_continuous(limits = c(0, 100)) +
+    scale_fill_manual(values = bootstrap_cols, drop = FALSE) +
+    labs(
+      x = "Exact ECG combination",
+      y = "% resamples in top 20%",
+      fill = "Resampling level",
+      title = "Most frequently recurring exact ECG combinations in top-20% pools",
+      subtitle = "This is not limited to originally displayed candidates"
+    ) +
+    theme_pub
+  
+  print(p_bootstrap_top20_frequency)
+  save_plot_both(p_bootstrap_top20_frequency, "p3_bootstrap_top20_frequency_all_sets", width = 12, height = 8)
+}
+```
+
+# Exact recurring subsets among top sets
+
+This section asks which exact lower-dimensional ECG subsets recur inside the top 20% parent combinations. For example, among top 5-channel combinations, it checks recurring 4-, 3-, 2-, and 1-channel cores. Enrichment is computed relative to how often that subset would occur among all possible parent combinations of the same size.
+
+```{r recurring-subsets}
+make_subset_strings <- function(ecg_leads, subset_size = 1) {
+  leads <- as.integer(strsplit(as.character(ecg_leads), ",")[[1]])
+  leads <- sort(unique(leads))
+  if (length(leads) < subset_size) return(character())
+  combn(leads, subset_size, FUN = function(z) paste(z, collapse = ","), simplify = TRUE)
+}
+
+make_ecg_lookup_basic <- function() {
+  if (exists("ecg15_channel_lookup")) {
+    return(ecg15_channel_lookup)
+  }
+  tibble(
+    ecg_lead = 1:15,
+    lead_label = c(
+      "right_front_neck", "left_front_neck", "right_supraclavicular", "left_supraclavicular",
+      "right_back_neck", "left_back_neck", "RA", "LA", "V1", "V2", "V3", "V4", "V5", "V6", "LL"
+    ),
+    electrode_group = c(
+      "neck", "neck", "supraclavicular", "supraclavicular", "neck", "neck",
+      "standard_limb_electrode", "standard_limb_electrode", rep("standard_chest_lead", 6), "standard_limb_electrode"
+    )
+  )
+}
+
+ecg_lookup_basic <- make_ecg_lookup_basic()
+
+label_subset <- function(subset_string, lookup = ecg_lookup_basic) {
+  leads <- as.integer(strsplit(as.character(subset_string), ",")[[1]])
+  labels <- lookup$lead_label[match(leads, lookup$ecg_lead)]
+  paste(labels, collapse = ",")
+}
+
+annotate_subset_basic <- function(subset_string, lookup = ecg_lookup_basic) {
+  leads <- as.integer(strsplit(as.character(subset_string), ",")[[1]])
+  subset_size <- length(leads)
+  groups <- lookup$electrode_group[match(leads, lookup$ecg_lead)]
+  n_v <- sum(groups == "standard_chest_lead", na.rm = TRUE)
+  n_neck <- sum(groups == "neck", na.rm = TRUE)
+  n_supra <- sum(groups == "supraclavicular", na.rm = TRUE)
+  n_upper_vascular <- n_neck + n_supra
+  n_standard_limb <- sum(groups == "standard_limb_electrode", na.rm = TRUE)
+  
+  contains_V <- n_v > 0
+  contains_upper_vascular <- n_upper_vascular > 0
+  contains_standard_limb <- n_standard_limb > 0
+  contains_limb_axis_or_like <- n_standard_limb >= 2
+  mostly_v <- n_v >= ceiling(0.60 * subset_size)
+  mostly_upper_vascular <- n_upper_vascular >= ceiling(0.60 * subset_size)
+  
+  subset_family <- assign_anatomical_family_exclusive(
+    n_total = subset_size,
+    n_V = n_v,
+    n_upper_vascular = n_upper_vascular,
+    n_standard_limb = n_standard_limb,
+    contains_V = contains_V,
+    contains_upper_vascular = contains_upper_vascular,
+    contains_standard_limb = contains_standard_limb
+  )
+  
+  tibble(
+    subset = subset_string,
+    subset_labels = label_subset(subset_string, lookup),
+    subset_size = subset_size,
+    n_V = n_v,
+    n_neck = n_neck,
+    n_supraclavicular = n_supra,
+    n_upper_vascular = n_upper_vascular,
+    n_standard_limb = n_standard_limb,
+    contains_V = contains_V,
+    contains_neck = n_neck > 0,
+    contains_supraclavicular = n_supra > 0,
+    contains_upper_vascular = contains_upper_vascular,
+    contains_standard_limb = contains_standard_limb,
+    contains_limb_axis_or_like = contains_limb_axis_or_like,
+    subset_family = factor(subset_family, levels = family_levels)
+  )
+}
+
+summarise_subsets_for_parent_n <- function(exact_summary, parent_n, top_pool_prop = settings$top_prop_main, total_n_leads = 15) {
+  parent_data <- exact_summary %>%
+    filter(n_ecg_leads == parent_n) %>%
+    arrange(rank_within_n)
+  
+  n_available <- nrow(parent_data)
+  n_top <- n_top_prop(n_available, prop = top_pool_prop)
+  top_pool <- parent_data %>%
+    slice_head(n = n_top) %>%
+    mutate(rank_in_top_pool = row_number())
+  
+  subset_sizes <- if (parent_n <= 1) integer(0) else seq(parent_n - 1, 1)
+  
+  map_dfr(subset_sizes, function(s) {
+    background_share <- choose(total_n_leads - s, parent_n - s) / choose(total_n_leads, parent_n)
+    
+    top_pool %>%
+      mutate(subset = map(ecg_leads, make_subset_strings, subset_size = s)) %>%
+      unnest(subset) %>%
+      group_by(subset) %>%
+      summarise(
+        parent_n_ecg_leads = parent_n,
+        subset_size = s,
+        top_pool_n = n_top,
+        total_parent_combinations = n_available,
+        n_top_combinations = n_distinct(combination_id),
+        top_share = n_top_combinations / n_top,
+        background_share = background_share,
+        enrichment_ratio = top_share / background_share,
+        best_rank_containing_subset = min(rank_in_top_pool, na.rm = TRUE),
+        median_rank_containing_subset = median(rank_in_top_pool, na.rm = TRUE),
+        mean_pct_channels_as_well_median = median(mean_pct_channels_as_well, na.rm = TRUE),
+        median_pct_channels_as_well_median = median(median_pct_channels_as_well, na.rm = TRUE),
+        q25_pct_channels_as_well_median = median(q25_pct_channels_as_well, na.rm = TRUE),
+        median_loss_sesoi_units_median = median(median_loss_sesoi_units, na.rm = TRUE),
+        median_q90_loss_sesoi_units_median = median(median_q90_loss_sesoi_units, na.rm = TRUE),
+        example_combinations = paste(head(ecg_leads[order(rank_in_top_pool)], 5), collapse = " | "),
+        .groups = "drop"
+      ) %>%
+      arrange(
+        desc(enrichment_ratio),
+        desc(top_share),
+        best_rank_containing_subset,
+        subset
+      )
+  })
+}
+
+recurring_subsets_all <- map_dfr(1:5, ~ summarise_subsets_for_parent_n(exact_summary_all, parent_n = .x))
+
+subset_annotation <- recurring_subsets_all %>%
+  distinct(subset) %>%
+  mutate(annotation = map(subset, annotate_subset_basic)) %>%
+  select(-subset) %>%
+  unnest(annotation) %>%
+  select(-subset_size)
+
+recurring_subsets_annotated <- recurring_subsets_all %>%
+  left_join(subset_annotation, by = "subset") %>%
+  arrange(parent_n_ecg_leads, desc(subset_size), desc(enrichment_ratio), desc(top_share), best_rank_containing_subset)
+
+recurring_subset_top_table <- recurring_subsets_annotated %>%
+  group_by(parent_n_ecg_leads, subset_size) %>%
+  slice_head(n = settings$top_subset_n_for_plots) %>%
+  ungroup() %>%
+  select(
+    parent_n_ecg_leads,
+    subset_size,
+    subset,
+    subset_labels,
+    subset_family,
+    top_pool_n,
+    n_top_combinations,
+    top_share,
+    background_share,
+    enrichment_ratio,
+    best_rank_containing_subset,
+    median_rank_containing_subset,
+    mean_pct_channels_as_well_median,
+    median_loss_sesoi_units_median,
+    median_q90_loss_sesoi_units_median,
+    example_combinations
+  )
+
+manifest[["18_recurring_subsets_annotated"]] <- save_table(recurring_subsets_annotated, "18_recurring_subsets_annotated")
+manifest[["19_recurring_subset_top_table"]] <- save_table(recurring_subset_top_table, "19_recurring_subset_top_table")
+
+kable_clean(recurring_subset_top_table, digits = 3)
+```
+
+```{r plot-recurring-subsets, fig.width=14, fig.height=10}
+subset_plot_all <- recurring_subsets_annotated %>%
+  filter(
+    is.finite(enrichment_ratio),
+    is.finite(top_share),
+    !is.na(subset_family),
+    !is.na(subset_labels)
+  ) %>%
+  group_by(parent_n_ecg_leads, subset_size) %>%
+  slice_head(n = settings$top_subset_n_for_plots) %>%
+  ungroup() %>%
+  mutate(
+    parent_label = paste0("Top 20% of ", parent_n_ecg_leads, "-channel combinations"),
+    subset_size_label = paste0(subset_size, "-channel recurring subset"),
+    plot_label = paste0(subset, " (", subset_labels, ")___", parent_n_ecg_leads, "___", subset_size),
+    plot_rank = enrichment_ratio + top_share,
+    plot_label = reorder(plot_label, plot_rank)
+  )
+
+if (nrow(subset_plot_all) > 0) {
+  p_recurring_subsets <- ggplot(
+    subset_plot_all,
+    aes(x = plot_label, y = enrichment_ratio, fill = top_share)
+  ) +
+    geom_col() +
+    geom_text(aes(label = paste0(round(100 * top_share, 1), "%")), hjust = -0.1, size = 2.6, family = fig_font_family) +
+    coord_flip(clip = "off") +
+    facet_grid(parent_label ~ subset_size_label, scales = "free_y", space = "free_y") +
+    scale_x_discrete(labels = function(x) sub("___.*$", "", x)) +
+    scale_fill_cca_heat(limits = c(0, 1), labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      x = "Recurring exact ECG subset",
+      y = "Enrichment relative to all possible parent combinations",
+      fill = "Share in\ntop pool",
+      title = "Recurring exact ECG cores among top reduced combinations",
+      subtitle = "Top pools are always the top 20% within each parent ECG-channel count; text shows occurrence share in that pool"
+    ) +
+    theme_pub +
+    theme(plot.margin = margin(5.5, 65, 5.5, 5.5), strip.text.y = element_text(angle = 0))
+} else {
+  p_recurring_subsets <- ggplot() +
+    annotate("text", x = 0, y = 0, label = "No finite recurring-subset rows to plot") +
+    theme_void(base_family = fig_font_family)
+}
+
+p_recurring_subsets
+save_plot_both(p_recurring_subsets, "p3_recurring_exact_subsets", width = 14, height = 10)
+```
+
+# Exclusive anatomical families
+
+The feature labels below are mutually exclusive. This avoids the earlier problem where the same ECG combination could be counted in several overlapping anatomical classes.
+
+```{r exclusive-anatomical-families}
+make_combination_annotation_lookup_clean <- function(max_n = 5) {
+  if (!exists("make_ecg15_combination_annotation_lookup")) {
+    stop("make_ecg15_combination_annotation_lookup() not found. Source ecg_annotations.R first.")
+  }
+  
+  ann <- make_ecg15_combination_annotation_lookup(max_n = max_n)
+  
+  if ("combo_leads" %in% names(ann) && !"ecg_leads" %in% names(ann)) {
+    ann <- ann %>% rename(ecg_leads = combo_leads)
+  }
+  
+  ann %>%
+    mutate(
+      n_ecg_leads = as.integer(n_ecg_leads),
+      combination_id = as.integer(combination_id),
+      ecg_leads = as.character(ecg_leads),
+      combo_uid = make_combo_uid(n_ecg_leads, combination_id, ecg_leads),
+      contains_any_V = contains_any_chest_V_location,
+      n_upper_vascular = n_neck + n_supraclavicular,
+      contains_upper_vascular = contains_any_neck | contains_any_supraclavicular,
+      contains_any_standard_limb = n_standard_limb_electrodes > 0,
+      contains_limb_axis_or_like =
+        n_Lead_I_like_pairs > 0 |
+        n_Lead_II_like_pairs > 0 |
+        n_Lead_III_like_pairs > 0,
+      contains_V_and_upper_vascular = contains_any_V & contains_upper_vascular,
+      contains_V_and_standard_limb = contains_any_V & contains_any_standard_limb,
+      contains_upper_vascular_and_standard_limb = contains_upper_vascular & contains_any_standard_limb,
+      contains_V_and_upper_vascular_and_standard_limb =
+        contains_any_V & contains_upper_vascular & contains_any_standard_limb
+    )
+}
+
+ecg15_combination_lookup <- make_combination_annotation_lookup_clean(max_n = 5) %>%
+  mutate(
+    anatomical_family_exclusive = assign_anatomical_family_exclusive(
+      n_total = n_ecg_leads,
+      n_V = n_chest_V_locations,
+      n_upper_vascular = n_upper_vascular,
+      n_standard_limb = n_standard_limb_electrodes,
+      contains_V = contains_any_V,
+      contains_upper_vascular = contains_upper_vascular,
+      contains_standard_limb = contains_any_standard_limb
+    ),
+    anatomical_family_exclusive = factor(
+      anatomical_family_exclusive,
+      levels = family_levels
+    )
+  )
+
+unclassified_family_check <- ecg15_combination_lookup %>%
+  filter(is.na(anatomical_family_exclusive))
+
+if (nrow(unclassified_family_check) > 0) {
+  print(
+    unclassified_family_check %>%
+      select(
+        n_ecg_leads,
+        combination_id,
+        ecg_leads,
+        n_chest_V_locations,
+        n_upper_vascular,
+        n_standard_limb_electrodes,
+        contains_any_V,
+        contains_upper_vascular,
+        contains_any_standard_limb
+      ) %>%
+      head(30)
+  )
+  stop(
+    "Some ECG combinations were not assigned to an anatomical family. ",
+    "Check whether every ECG channel belongs to V/precordial, ",
+    "neck/supraclavicular, or limb anchor."
+  )
+}
+
+exact_summary_annotated <- exact_summary_all %>%
+  left_join(
+    ecg15_combination_lookup %>%
+      select(
+        n_ecg_leads, combination_id, ecg_leads, combo_uid,
+        combo_labels, combo_groups, combination_family,
+        anatomical_family_exclusive,
+        n_neck, n_supraclavicular, n_standard_limb_electrodes,
+        n_chest_V_locations, n_upper_vascular,
+        contains_any_V, contains_upper_vascular, contains_any_standard_limb,
+        contains_limb_axis_or_like
+      ),
+    by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")
+  )
+
+manifest[["20_exact_summary_annotated"]] <- save_table(exact_summary_annotated, "20_exact_summary_annotated")
+
+# Overall top-20% exact family prevalence.
+top20_exact_annotated <- exact_summary_annotated %>%
+  group_by(n_ecg_leads) %>%
+  arrange(rank_within_n, .by_group = TRUE) %>%
+  mutate(
+    top20_cutoff = n_top_prop(n()),
+    in_top20 = rank_within_n <= top20_cutoff
+  ) %>%
+  ungroup() %>%
+  filter(in_top20, !is.na(anatomical_family_exclusive))
+
+overall_family_prevalence <- top20_exact_annotated %>%
+  count(n_ecg_leads, anatomical_family_exclusive, name = "n_top20_family") %>%
+  group_by(n_ecg_leads) %>%
+  mutate(
+    n_top20_total = sum(n_top20_family),
+    family_share_top20 = n_top20_family / n_top20_total
+  ) %>%
+  ungroup() %>%
+  arrange(n_ecg_leads, desc(family_share_top20), anatomical_family_exclusive)
+
+# Participant-specific top-20% family prevalence.
+participant_top20_annotated <- exact_participant_summary_all %>%
+  group_by(participant, n_ecg_leads) %>%
+  arrange(desc(pct_channels_as_well), median_loss_sesoi_units, q90_loss_sesoi_units, ecg_leads, .by_group = TRUE) %>%
+  mutate(
+    participant_rank = row_number(),
+    participant_top20_cutoff = n_top_prop(n()),
+    participant_in_top20 = participant_rank <= participant_top20_cutoff
+  ) %>%
+  ungroup() %>%
+  filter(participant_in_top20) %>%
+  left_join(
+    ecg15_combination_lookup %>% select(n_ecg_leads, combination_id, ecg_leads, combo_uid, anatomical_family_exclusive),
+    by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")
+  )
+
+participant_family_summary <- participant_top20_annotated %>%
+  group_by(participant, n_ecg_leads, anatomical_family_exclusive) %>%
+  summarise(
+    n_family = n_distinct(combo_uid),
+    median_performance = median(pct_channels_as_well, na.rm = TRUE),
+    median_loss = median(median_loss_sesoi_units, na.rm = TRUE),
+    .groups = "drop_last"
+  ) %>%
+  mutate(top20_family_share = n_family / sum(n_family, na.rm = TRUE)) %>%
+  ungroup()
+
+participant_family_group_summary <- participant_family_summary %>%
+  group_by(n_ecg_leads, anatomical_family_exclusive) %>%
+  summarise(
+    n_participants_total = n_distinct(participant_top20_annotated$participant),
+    n_participants_with_family = n_distinct(participant),
+    median_family_share = median(top20_family_share, na.rm = TRUE),
+    q25_family_share = safe_q(top20_family_share, 0.25),
+    q75_family_share = safe_q(top20_family_share, 0.75),
+    median_performance = median(median_performance, na.rm = TRUE),
+    median_loss = median(median_loss, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(n_ecg_leads, desc(n_participants_with_family), desc(median_family_share), anatomical_family_exclusive)
+
+# Channel-specific top-20% family prevalence.
+channel_top20_annotated <- exact_channel_summary_all %>%
+  group_by(channel, n_ecg_leads) %>%
+  arrange(desc(pct_participants_as_well), median_loss_sesoi_units, q90_loss_sesoi_units, ecg_leads, .by_group = TRUE) %>%
+  mutate(
+    channel_rank = row_number(),
+    channel_top20_cutoff = n_top_prop(n()),
+    channel_in_top20 = channel_rank <= channel_top20_cutoff
+  ) %>%
+  ungroup() %>%
+  filter(channel_in_top20) %>%
+  left_join(
+    ecg15_combination_lookup %>% select(n_ecg_leads, combination_id, ecg_leads, combo_uid, anatomical_family_exclusive),
+    by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")
+  )
+
+channel_family_summary <- channel_top20_annotated %>%
+  group_by(channel, n_ecg_leads, anatomical_family_exclusive) %>%
+  summarise(
+    n_family = n_distinct(combo_uid),
+    median_performance = median(pct_participants_as_well, na.rm = TRUE),
+    median_loss = median(median_loss_sesoi_units, na.rm = TRUE),
+    .groups = "drop_last"
+  ) %>%
+  mutate(top20_family_share = n_family / sum(n_family, na.rm = TRUE)) %>%
+  ungroup()
+
+channel_family_group_summary <- channel_family_summary %>%
+  group_by(n_ecg_leads, anatomical_family_exclusive) %>%
+  summarise(
+    n_channels_total = n_distinct(channel_top20_annotated$channel),
+    n_channels_with_family = n_distinct(channel),
+    median_family_share = median(top20_family_share, na.rm = TRUE),
+    q25_family_share = safe_q(top20_family_share, 0.25),
+    q75_family_share = safe_q(top20_family_share, 0.75),
+    median_performance = median(median_performance, na.rm = TRUE),
+    median_loss = median(median_loss, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(n_ecg_leads, desc(n_channels_with_family), desc(median_family_share), anatomical_family_exclusive)
+
+manifest[["21_overall_family_prevalence_top20"]] <- save_table(overall_family_prevalence, "21_overall_family_prevalence_top20")
+manifest[["22_participant_family_summary_top20"]] <- save_table(participant_family_summary, "22_participant_family_summary_top20")
+manifest[["23_participant_family_group_summary_top20"]] <- save_table(participant_family_group_summary, "23_participant_family_group_summary_top20")
+manifest[["24_channel_family_summary_top20"]] <- save_table(channel_family_summary, "24_channel_family_summary_top20")
+manifest[["25_channel_family_group_summary_top20"]] <- save_table(channel_family_group_summary, "25_channel_family_group_summary_top20")
+
+kable_clean(overall_family_prevalence, digits = 3)
+kable_clean(participant_family_group_summary, digits = 3)
+kable_clean(channel_family_group_summary, digits = 3)
+```
+
+```{r plot-exclusive-family-heatmaps, fig.width=12, fig.height=9}
+overall_family_plot_data <- overall_family_prevalence %>%
+  mutate(
+    validation_level = "Overall exact top 20%",
+    n_units_with_family = n_top20_family,
+    n_units_total = n_top20_total,
+    median_family_share = family_share_top20
+  ) %>%
+  select(validation_level, n_ecg_leads, anatomical_family_exclusive, n_units_with_family, n_units_total, median_family_share)
+
+participant_family_plot_data <- participant_family_group_summary %>%
+  transmute(
+    validation_level = "Participant-specific top 20%",
+    n_ecg_leads,
+    anatomical_family_exclusive,
+    n_units_with_family = n_participants_with_family,
+    n_units_total = n_participants_total,
+    median_family_share
+  )
+
+channel_family_plot_data <- channel_family_group_summary %>%
+  transmute(
+    validation_level = "EEG-channel-specific top 20%",
+    n_ecg_leads,
+    anatomical_family_exclusive,
+    n_units_with_family = n_channels_with_family,
+    n_units_total = n_channels_total,
+    median_family_share
+  )
+
+family_heatmap_data <- bind_rows(
+  overall_family_plot_data,
+  participant_family_plot_data,
+  channel_family_plot_data
+) %>%
+  filter(n_units_with_family > 0) %>%
+  group_by(anatomical_family_exclusive) %>%
+  mutate(family_order = max(n_units_with_family + median_family_share, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(
+    n_ecg_leads = factor(n_ecg_leads),
+    anatomical_family_exclusive = factor(anatomical_family_exclusive, levels = family_levels),
+    tile_label = paste0(n_units_with_family, "/", n_units_total, "\n", round(100 * median_family_share), "%"),
+    validation_level = factor(
+      validation_level,
+      levels = c("Overall exact top 20%", "Participant-specific top 20%", "EEG-channel-specific top 20%")
+    )
+  )
+
+p_family_heatmap <- ggplot(
+  family_heatmap_data,
+  aes(x = n_ecg_leads, y = anatomical_family_exclusive, fill = median_family_share)
+) +
+  geom_tile(colour = "white", linewidth = 0.30) +
+  geom_text(aes(label = tile_label), size = 2.7, family = fig_font_family) +
+  facet_wrap(~ validation_level, nrow = 1) +
+  scale_y_discrete(limits = rev) +
+  scale_fill_cca_heat(limits = c(0, 1), labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Number of ECG channels",
+    y = "Exclusive anatomical family",
+    fill = "Family share\nin top 20%",
+    title = "Exclusive anatomical family prevalence among top ECG combinations",
+    subtitle = "Text shows presence count and median family share; families are mutually exclusive"
+  ) +
+  theme_pub +
+  theme(axis.text.y = element_text(size = 8))
+
+p_family_heatmap
+save_plot_both(p_family_heatmap, "p3_exclusive_family_prevalence_heatmaps", width = 12, height = 9)
+```
+
+```{r additional-anatomical-stability-plots, fig.width=12, fig.height=8}
+# Anatomical family stability under participant/channel bootstrap.
+bootstrap_family_group_summary <- tibble()
+
+if (exists("bootstrap_top20_hits_all") && nrow(bootstrap_top20_hits_all) > 0) {
+  bootstrap_top20_hits_annotated <- bootstrap_top20_hits_all %>%
+    left_join(
+      ecg15_combination_lookup %>% select(n_ecg_leads, combination_id, ecg_leads, combo_uid, anatomical_family_exclusive),
+      by = c("n_ecg_leads", "combination_id", "ecg_leads", "combo_uid")
+    )
+  
+  bootstrap_family_summary <- bootstrap_top20_hits_annotated %>%
+    filter(!is.na(anatomical_family_exclusive)) %>%
+    group_by(stability_type, bootstrap, n_ecg_leads, anatomical_family_exclusive) %>%
+    summarise(n_hits_family = n_distinct(combo_uid), .groups = "drop") %>%
+    group_by(stability_type, bootstrap, n_ecg_leads) %>%
+    mutate(family_share = n_hits_family / sum(n_hits_family, na.rm = TRUE)) %>%
+    ungroup()
+  
+  bootstrap_family_group_summary <- bootstrap_family_summary %>%
+    group_by(stability_type, n_ecg_leads, anatomical_family_exclusive) %>%
+    summarise(
+      median_family_share = median(family_share, na.rm = TRUE),
+      q25_family_share = safe_q(family_share, 0.25),
+      q75_family_share = safe_q(family_share, 0.75),
+      pct_boot_present = 100 * mean(family_share > 0, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(stability_type, n_ecg_leads, desc(median_family_share), desc(pct_boot_present))
+}
+
+if (nrow(bootstrap_family_group_summary) > 0) {
+  bootstrap_family_plot_data <- bootstrap_family_group_summary %>%
+    filter(pct_boot_present > 10) %>%
+    mutate(
+      stability_type = factor(stability_type, levels = c("participant", "channel"), labels = c("Participant resampling", "EEG-channel resampling")),
+      anatomical_family_exclusive = reorder(anatomical_family_exclusive, median_family_share),
+      n_ecg_leads = factor(n_ecg_leads)
+    )
+  
+  p_bootstrap_family_stability <- ggplot(
+    bootstrap_family_plot_data,
+    aes(x = anatomical_family_exclusive, y = median_family_share)
+  ) +
+    geom_col() +
+    geom_errorbar(aes(ymin = q25_family_share, ymax = q75_family_share), width = 0.2) +
+    coord_flip() +
+    facet_grid(stability_type ~ n_ecg_leads, scales = "free_y", labeller = labeller(n_ecg_leads = function(x) paste0(x, " ECG channels"))) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, NA)) +
+    labs(
+      x = "Anatomical family",
+      y = "Median share among bootstrap top hits",
+      title = "Anatomical stability under participant and channel bootstrap",
+      subtitle = "If exact electrodes are unstable but families remain stable, this supports anatomical aggregation"
+    ) +
+    theme_pub
+  
+  print(p_bootstrap_family_stability)
+  save_plot_both(p_bootstrap_family_stability, "p3_bootstrap_anatomical_family_stability", width = 12, height = 8)
+}
+
+manifest[["28_bootstrap_family_group_summary"]] <- save_table(bootstrap_family_group_summary, "28_bootstrap_family_group_summary")
+
+```
+
+# Text-ready summaries
+
+```{r text-ready-summary}
+best_per_n_text_table <- exact_summary_all %>%
+  group_by(n_ecg_leads) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(
+    n_ecg_leads,
+    best_ecg_leads = ecg_leads,
+    median_pct_channels_as_well,
+    q25_pct_channels_as_well,
+    q75_pct_channels_as_well,
+    n_participants_ge50_channels,
+    n_participants_total,
+    pct_cells_as_well,
+    pct_cells_worse,
+    n_participant_channel_cells,
+    median_loss_sesoi_units,
+    median_q90_loss_sesoi_units,
+    median_loss_pct_baseline,
+    median_pct_full15_improvement_recovered
+  )
+
+text_stubs <- best_per_n_text_table %>%
+  mutate(
+    sentence = paste0(
+      "The best ", n_ecg_leads, "-channel configuration was ", best_ecg_leads,
+      ", with median participant-level EEG-channel coverage of ", fmt_pct(median_pct_channels_as_well),
+      " (IQR ", fmt_pct(q25_pct_channels_as_well), "–", fmt_pct(q75_pct_channels_as_well), "). ",
+      "Across participant × EEG-channel cells, ", fmt_pct(pct_cells_as_well),
+      " were not meaningfully worse than full 15 and ", fmt_pct(pct_cells_worse),
+      " were worse beyond SESOI. ",
+      "It reached ≥50% channel coverage in ", n_participants_ge50_channels, "/", n_participants_total,
+      " participants, with median loss ", fmt_num(median_loss_sesoi_units),
+      " SESOI units and median recovery of ", fmt_pct(median_pct_full15_improvement_recovered),
+      " of the full 15-channel improvement."
+    )
+  ) %>%
+  select(n_ecg_leads, sentence)
+
+manifest[["29_best_per_n_text_table"]] <- save_table(best_per_n_text_table, "29_best_per_n_text_table")
+manifest[["30_text_stubs"]] <- save_table(text_stubs, "30_text_stubs")
+
+kable_clean(best_per_n_text_table, digits = 2)
+cat(paste(text_stubs$sentence, collapse = "\n\n"))
+```
+
+# Output manifest
+
+```{r manifest}
+manifest_df <- bind_rows(manifest)
+manifest_public <- manifest_df %>%
+  mutate(
+    rds = if_else(is.na(rds), NA_character_, basename(rds)),
+    csv = if_else(is.na(csv), NA_character_, basename(csv))
+  )
+
+saveRDS(manifest_public, file.path(outpath, "99_manifest.rds"))
+utils::write.csv(manifest_public, file.path(outpath, "99_manifest.csv"), row.names = FALSE)
+
+cat("Manifest saved as 99_manifest.rds and 99_manifest.csv.\n")
+
+if (isTRUE(params$show_manifest)) {
+  kable_clean(manifest_public)
+}
+```
