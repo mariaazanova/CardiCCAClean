@@ -1,0 +1,1 @@
+Statistical analyses in the form of markdown files for the project: Vidaurre, C., Azanova, M., Germanova, K., Greschke, E., Steinfath, T. P., Laufs, U., Uhe, T., Villringer, A., & Nikulin, V. (2026). Canonical Correlation Analysis and Multi-Channel Cardiography Improve Artefact Cleaning in Heartbeat-Locked Analyses. biorXiv Neuroscience. https://doi.org/10.64898/2026.07.14.738519
